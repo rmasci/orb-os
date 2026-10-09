@@ -542,6 +542,34 @@ void setRotation(uint16_t degrees) {
 }
 uint16_t rotation() { return s_rot; }
 
+void mapTouchCoords(uint16_t x, uint16_t y, int &lx, int &ly) {
+    lx = x; ly = y;
+    const uint16_t angle = s_rot;
+    switch (angle) {
+        case 90:  lx = y;                        ly = SCREEN_H - 1 - x; break;
+        case 180: lx = SCREEN_W - 1 - x;         ly = SCREEN_H - 1 - y; break;
+        case 270: lx = SCREEN_W - 1 - y;         ly = x; break;
+        default:
+            if (angle != 0) {
+                const int relX2 = 2 * (int)x - (SCREEN_W - 1);
+                const int relY2 = 2 * (int)y - (SCREEN_H - 1);
+                const int64_t sx2q = (int64_t)(SCREEN_W - 1) * 65536
+                                   + (int64_t)s_rotCosQ16 * relX2
+                                   + (int64_t)s_rotSinQ16 * relY2;
+                const int64_t sy2q = (int64_t)(SCREEN_H - 1) * 65536
+                                   - (int64_t)s_rotSinQ16 * relX2
+                                   + (int64_t)s_rotCosQ16 * relY2;
+                lx = (int)((sx2q + 65536) >> 17);
+                ly = (int)((sy2q + 65536) >> 17);
+            }
+            break;
+    }
+    if (lx < 0) lx = 0;
+    if (lx >= SCREEN_W) lx = SCREEN_W - 1;
+    if (ly < 0) ly = 0;
+    if (ly >= SCREEN_H) ly = SCREEN_H - 1;
+}
+
 uint32_t inactiveMs() { return lv_disp_get_inactive_time(NULL); }
 void noteActivity() { lv_disp_trig_activity(NULL); }
 

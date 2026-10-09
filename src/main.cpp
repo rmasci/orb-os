@@ -42,6 +42,7 @@
 #include "theme_audio.h"   // sounds a theme brings with it: wind.pcm, chime.pcm
 #include "chime_library.h" // every chime on the device, from flash and from every theme
 #include "display.h"                  // M0: CO5300 + LVGL bring-up
+#include "touch_cst9217.h"            // CST9217 capacitive touch + gestures
 #include "popup_notice.h"
 #include "lv_psram_alloc.h"           // [lvmem]: what the LVGL allocator holds, and where
 #include "imu_qmi8658.h"             // face-down sleep
@@ -1072,6 +1073,15 @@ static void applyBrightness() {
     if (g_asleep) b = 0;                                         // face-down -> screen off
     if (g_updateBright) b = 255;                                 // an update outranks both
     display::setBrightness(b);
+}
+
+void host_wake_display() {
+    display::noteActivity();
+    if (g_idle) { g_idle = false; applyBrightness(); }
+}
+
+bool host_is_idle() {
+    return g_idle;
 }
 
 // update_ui's hook (declared extern there). The transfer counts as activity too, so the
@@ -3898,6 +3908,7 @@ void setup() {
     imu_begin();       // face-down sleep (no-op if the IMU isn't detected)
     battery_begin();   // AXP2101 (no-op if not detected / no battery)
     battery_enable_codec_rail();   // power the ES8311 analog rail before audio init
+    touch_begin();     // CST9217 capacitive touch + gestures
 
     setenv("TZ", g_tz.c_str(), 1); tzset();   // local time for display even before NTP (loadSettings ran above)
     rtc_begin();
@@ -4568,6 +4579,7 @@ void loop() {
         delay(50);
         ESP.restart();
     }
+    touch_poll();                   // poll capacitive touch + gestures (tap, scroll, swipe)
     {
         int32_t kd = knob::takeDelta();
         bool pressed = knob::takePress();

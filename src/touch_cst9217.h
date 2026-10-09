@@ -5,3 +5,4 @@
 
 bool touch_begin();                       // I2C + hardware reset; logs comms status
 bool touch_read(uint16_t *x, uint16_t *y); // true if currently pressed (x,y in screen px)
+void touch_poll();                        // Gesture processing (tap, scroll, swipe) called in loop()

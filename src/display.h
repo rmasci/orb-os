@@ -39,6 +39,10 @@ void noteActivity();
 void setRotation(uint16_t degrees);
 uint16_t rotation();
 
+// Transforms raw touch sensor coordinates (x, y) into logical screen coordinates (lx, ly)
+// accounting for display rotation and tilt offset.
+void mapTouchCoords(uint16_t x, uint16_t y, int &lx, int &ly);
+
 } // namespace display
 
 uint32_t display_frames();   // total rendered frames (for FPS measurement)

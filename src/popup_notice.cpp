@@ -154,7 +154,7 @@ void popup_notice::show(const char *msg, const char *title, uint32_t timeoutMs) 
 
     // Bottom dismiss hint
     s_hint = lv_label_create(s_card);
-    lv_label_set_text(s_hint, "turn or push to dismiss");
+    lv_label_set_text(s_hint, "tap, turn or push to dismiss");
     lv_obj_set_style_text_color(s_hint, hintColor, 0);
     lv_obj_set_style_text_font(s_hint, &lv_font_montserrat_14, 0);
     lv_obj_align(s_hint, LV_ALIGN_BOTTOM_MID, 0, -8);
