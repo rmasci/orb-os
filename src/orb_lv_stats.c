@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include "lv_psram_alloc.h"   // the bucket count, so the two cannot drift apart
 
+#if ORB_LV_STATS
 // Live allocations, by requested size. Bucket 0 is everything under 64 bytes and each
 // bucket after it covers twice the span of the one before, so the eight read:
 //   0:<64  1:<128  2:<256  3:<512  4:<1024  5:<2048  6:<4096  7:>=4096.
@@ -41,3 +42,4 @@ uint32_t orb_lv_peak_int_bytes;
 // which is the shape of the font boot-loop this wrapper was written for.
 uint32_t orb_lv_fallback_to_int;
 uint32_t orb_lv_fallback_to_ext;
+#endif

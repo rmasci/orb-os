@@ -3450,6 +3450,64 @@ static unsigned host_internal_free_blocks() {
     heap_caps_get_info(&hi, MALLOC_CAP_INTERNAL);
     return (unsigned)hi.free_blocks;
 }
+// ---- where the second goes outside LVGL -----------------------------------------------
+// Measured 2026-10-06: LVGL owned ~640 ms of every second on the Flight Tracker while the frame
+// rate sat well below what the per-frame cost implied, and the missing ~360 ms was neither the
+// web server nor the ADS-B fetch -- both ruled out by suppressing each and watching the figure
+// refuse to move. This splits the rest of loop() by name rather than guessing again.
+//
+// It found the delay() at the bottom of this function: CONFIG_FREERTOS_HZ is 1000, so delay(5)
+// is a real five-millisecond vTaskDelay every pass. Cutting it to 1 ms raised passes from 53 to
+// 128 a second and changed the frame rate not at all, which is how we know frames were never
+// what the loop was short of. Left at 5 for that reason -- spending the CPU buys nothing.
+static uint32_t g_loopDelayMs = 5;
+enum { LP_INPUT = 0, LP_LVGL, LP_NET, LP_WORK, LP_DELAY, LP_N };
+static const char *LP_NAME[LP_N] = { "input", "lvgl", "net", "work", "delay" };
+static uint32_t g_lp[LP_N] = { 0 };
+static uint32_t g_lpPasses = 0, g_lpAt = 0;
+static volatile uint32_t g_lpPerS = 0;
+
+static inline void loop_phase_report(const uint32_t *t) {
+    for (int i = 0; i < LP_N; ++i) g_lp[i] += t[i + 1] - t[i];
+    ++g_lpPasses;
+    const uint32_t now = millis();
+    if (now - g_lpAt <= 10000) return;
+    if (g_lpAt && g_lpPasses) {
+        const uint32_t span = now - g_lpAt;
+        g_lpPerS = g_lpPasses * 1000UL / span;
+        // ms per SECOND, not per pass: a 40 us phase run 200 times a second is not a small cost.
+        Serial.printf("[loop] %lu passes/s:", (unsigned long)g_lpPerS);
+        for (int i = 0; i < LP_N; ++i)
+            Serial.printf(" %s %lu ms/s", LP_NAME[i], (unsigned long)(g_lp[i] / 1000UL * 1000UL / span));
+        Serial.printf(" (delay=%lu ms)\n", (unsigned long)g_loopDelayMs);
+    }
+    g_lpAt = now; g_lpPasses = 0;
+    for (int i = 0; i < LP_N; ++i) g_lp[i] = 0;
+}
+static unsigned host_loop_per_s() { return (unsigned)g_lpPerS; }
+
+// Time per second parked in the panel's vertical blanking. Real latency, so it belongs in the
+// same ledger as render and transfer cost.
+static unsigned host_te_load() {
+    static uint32_t last = 0, lastMs = 0;
+    const uint32_t us = display_te_wait_us(), now = millis();
+    unsigned v = 0;
+    if (lastMs && now > lastMs) v = (unsigned)(((us - last) / 1000UL) * 1000UL / (now - lastMs));
+    last = us; lastMs = now;
+    return v;
+}
+// Hundredths of a screen per second ACTUALLY sent to the panel. Paired with screens_per_s
+// (what LVGL rendered) this says whether the box being pushed is bigger than the area that
+// changed -- the mistake a full-width band made before the box was tightened.
+static unsigned host_pushed_load() {
+    static uint32_t last = 0, lastMs = 0;
+    const uint32_t px = display_pushed_px(), now = millis();
+    unsigned v = 0;
+    const uint32_t perScreen = (uint32_t)SCREEN_W * SCREEN_H;
+    if (lastMs && now > lastMs) v = (unsigned)(((px - last) * 100UL / perScreen) * 1000UL / (now - lastMs));
+    last = px; lastMs = now;
+    return v;
+}
 static unsigned host_flush_load() {
     static uint32_t last = 0, lastMs = 0;
     const uint32_t us = display_flush_us(), now = millis();
@@ -4236,6 +4294,44 @@ void setup() {
             g_web.send(200, "text/plain", "poll set");
             return;
         }
+        // Tear-free flush on/off, and the staged flush itself. These are the two that address
+        // what can actually be SEEN; everything else on this endpoint prices a layer.
+        if (g_web.hasArg("te")) {
+            display_set_te(g_web.arg("te") != "0");
+            g_web.send(200, "text/plain", display_te() ? "te on" : "te off");
+            return;
+        }
+        if (g_web.hasArg("stage")) {
+            display_set_stage(g_web.arg("stage") != "0");
+            g_web.send(200, "text/plain", display_stage() ? "staged" : "per-strip");
+            return;
+        }
+        // The fan's line count, mirrored from the cable's `?orb trailsteps`, because the cable is
+        // exactly what is unavailable when the Orb is diagnosed from a machine with no COM port.
+        // Measured the biggest single lever on the Flight Tracker's frame rate.
+        if (g_web.hasArg("trailsteps")) {
+            const int n = (int)g_web.arg("trailsteps").toInt();
+            radar::setTrailSteps(n);
+            g_web.send(200, "text/plain", n ? String("trailSteps=") + n : String("trailSteps=design"));
+            return;
+        }
+        if (g_web.hasArg("blipaa")) {
+            const bool on = (g_web.arg("blipaa") != "0");
+            radar::setBlipAA(on ? 1 : 0);
+            g_web.send(200, "text/plain", on ? "blip aa on" : "blip aa off");
+            return;
+        }
+        if (g_web.hasArg("pace")) {
+            radar::setPacePct((int)g_web.arg("pace").toInt());
+            g_web.send(200, "text/plain", String("pace=") + g_web.arg("pace") + "%");
+            return;
+        }
+        if (g_web.hasArg("loopdelay")) {
+            g_loopDelayMs = (uint32_t)constrain(g_web.arg("loopdelay").toInt(), 1L, 20L);
+            Serial.printf("[loop] delay -> %lu ms\n", (unsigned long)g_loopDelayMs);
+            g_web.send(200, "text/plain", String("loopdelay=") + g_loopDelayMs);
+            return;
+        }
         const int  kind = g_web.arg("layer").toInt();
         const bool hide = (g_web.arg("hide") != "0");
         radar::debugHideLayer(kind, hide);
@@ -4246,18 +4342,30 @@ void setup() {
     // free: an allocation can fail with plenty of total free PSRAM if churn has
     // fragmented it below the requested size.
     g_web.on("/health", withAuth([]{
-        // 1024, not 640. Measured rather than estimated: a real reading off Zion's Orb on
-        // 2026-10-07 was 587 bytes, so 640 had 53 to spare, and the five compose fields
-        // below are 70. It would have truncated on the first device that reported them.
+        // 1024, not 640, and the return value is CHECKED rather than trusted.
         //
-        // This is a bigger number, not a fix. Greg's open PR #5 replaces the fixed buffer,
-        // because the fault is that snprintf returns what it WOULD have written and nobody
-        // checks, so the next field to be added breaks every reader silently. Take that one;
-        // do not treat this line as having dealt with it.
+        // A bigger buffer was never the fix. The note that raised this to 640 said exactly
+        // what happens when the field list outgrows it -- "snprintf would have silently
+        // truncated the JSON into something no client could parse" -- and on 2026-10-06 it
+        // did, at 639 bytes, the moment a handful of display fields were added. A reading off
+        // Zion's Orb on 2026-10-07 was 587 bytes, so 640 had 53 to spare against five compose
+        // fields that are 70: it would have truncated on the first device to report them.
+        //
+        // Raising the number only moves the cliff. snprintf returns what it WOULD have
+        // written and nothing looked, so the next field added breaks every reader in silence
+        // -- including the readers diagnosing something else entirely, which is what makes a
+        // truncated /health so expensive. So the length is tested below.
         char b[1024];
         float cFace = 0, cPlate = 0, cText = 0, cHands = 0;
         clockview::composeCost(cFace, cPlate, cText, cHands);
-        snprintf(b, sizeof(b),
+        // The CADENCE of the sweeping hand, as measured between wakes rather than as the
+        // timer intended them. Added with 2.16.72's fix because the four diagnoses that
+        // preceded it were all argued from what the code said rather than from what the
+        // hand did, and this is what tells them apart next time: sweep_early must be 0
+        // (a wake before its boundary — the freeze-and-snap signature), and the jitter
+        // pair separates an even slow beat from an uneven fast one, which fps cannot.
+        clockview::Cadence cad; clockview::cadence(cad);
+        const int n = snprintf(b, sizeof(b),
                  // slug is the permanent folder id, theme is the display name. Reporting
                  // only the slug is what made "Modern" and "the-office" look unrelated.
                  // `assets` is the fingerprint of the theme data this device is actually
@@ -4268,6 +4376,8 @@ void setup() {
                  "\"psram_free_kb\":%u,\"psram_largest_kb\":%u,"
                  "\"heap_free_kb\":%u,\"heap_largest_kb\":%u,"
                  "\"fps\":%u,\"lvgl_ms_per_s\":%u,\"flush_ms_per_s\":%u,"
+                 "\"te\":%d,\"stage\":%d,\"te_ms_per_s\":%u,\"pushed_per_s\":%u,"
+                 "\"loop_per_s\":%u,\"loop_delay_ms\":%u,"
                  "\"screens_per_s\":%u,"
                  "\"sweep\":%s,\"railway\":%s,\"beat_per_s\":%d,\"bph\":%d,"
                  "\"bg_extra_frames\":%d,\"bg_extra_baked\":%d,"
@@ -4275,7 +4385,10 @@ void setup() {
                  "\"bg_fps\":%d,\"bg_loop\":%s,\"bg_every_s\":%d,"
                  "\"alloc_blocks\":%u,\"free_blocks\":%u,"
                  "\"lv_int\":%u,\"lv_allocs\":%u,\"lv_peak_int\":%u,"
-                 "\"compose_ms\":%d,\"plate_ms\":%d,\"text_ms\":%d,\"hands_ms\":%d,\"rest_ms\":%d,"
+                 "\"compose_ms\":%d,\"plate_ms\":%d,\"text_ms\":%d,\"hands_ms\":%d,\"rest_ms\":%d,\""
+                 "sweep_wakes\":%u,\"sweep_jitter_ms\":%u,\"sweep_jitter_max_ms\":%u,"
+                 "\"sweep_early\":%u,\"sweep_late\":%u,\"sweep_dup\":%u,\"sweep_skip\":%u,"
+                 "\"sweep_beat\":%d,\"sweep_frame_ms\":%d,"
                  "\"wifi_rssi\":%d,\"boot_reason\":\"%s\"}",
                  FW_VERSION, theme_select::activeSlug(), theme_style::themeLabel(),
                  (unsigned long)CUSTOM_WELD_HASH,
@@ -4285,7 +4398,10 @@ void setup() {
                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
                  (unsigned)(ESP.getFreeHeap() / 1024),
                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
-                 host_fps(), host_lvgl_load(), host_flush_load(), host_screens_per_s(),
+                 host_fps(), host_lvgl_load(), host_flush_load(),
+                 display_te() ? 1 : 0, display_stage() ? 1 : 0, host_te_load(), host_pushed_load(),
+                 host_loop_per_s(), (unsigned)g_loopDelayMs,
+                 host_screens_per_s(),
                  theme_style::clock().secondSweep   ? "true" : "false",
                  theme_style::clock().secondRailway ? "true" : "false",
                  clockview::sweepBeat(), clockview::sweepBeat() * 3600,
@@ -4301,8 +4417,15 @@ void setup() {
                  (unsigned)orb_lv_peak_int_bytes,
                  (int)(cFace + 0.5f), (int)(cPlate + 0.5f), (int)(cText + 0.5f),
                  (int)(cHands + 0.5f), (int)(cFace - cPlate - cText - cHands + 0.5f),
+                 cad.wakes, cad.jitAvgMs, cad.jitMaxMs,
+                 cad.early, cad.late, cad.dup, cad.skip,
+                 cad.beat, (int)(cad.frameMs + 0.5f),
                  (int)WiFi.RSSI(),
                  diag::resetReasonText());
+        // snprintf reports what it WOULD have written, so this is the only way to notice.
+        if (n < 0 || (size_t)n >= sizeof(b))
+            Serial.printf("[health] JSON truncated: needed %d bytes, buffer is %u\n",
+                          n, (unsigned)sizeof(b));
         g_web.send(200, "application/json", b);
     }));
     g_web.on("/sdput", HTTP_POST, withAuth(handleSdPutDone), withAuth(handleSdPutUpload));   // Launch Kit pushes theme files here
@@ -4422,6 +4545,8 @@ void setup() {
 }
 
 void loop() {
+    uint32_t lpT[LP_N + 1];
+    lpT[0] = micros();
     // INPUT FIRST. The encoder is interrupt-driven, so no detent is ever lost — but this
     // used to run at the BOTTOM of the loop, after a full LVGL render and after the web
     // server. A detent arriving while the screen was drawing therefore waited for that
@@ -4461,14 +4586,17 @@ void loop() {
     }
     input_router::tick();                                    // a settling rock, resolved without new input
 
+    lpT[1] = micros();
     display::loop();                // drive LVGL (render dirty areas + run timers)
 
     // Network and sensors last: they are throughput work, not interactive. handleClient()
     // in particular can spend real time on an /sdput chunk, and nothing about it should
     // sit between a knob turn and the frame that answers it.
+    lpT[2] = micros();
     g_wm.process();                 // service the WiFi config portal (non-blocking)
     g_web.handleClient();           // serve the configuration web page
     orb_link::poll();               // answer Orb Studio over the USB cable (bounded, non-blocking)
+    lpT[3] = micros();
     // Mid-install, lean into the port instead of the screen. Every chunk needs a round
     // trip through this loop, so at the radar's ~77 ms frame the transfer crawled at one
     // chunk per frame: 5 KB/s, against 18 KB/s with the loop free. The display is showing
@@ -4842,5 +4970,10 @@ void loop() {
         }
     }
 
-    delay(5);
+    lpT[4] = micros();
+    // Tunable so the trade between pass rate and leaving other tasks room can be measured on a
+    // running Orb. Clamped at 1: zero stops yielding to this core's idle task.
+    delay(g_loopDelayMs);
+    lpT[5] = micros();
+    loop_phase_report(lpT);
 }

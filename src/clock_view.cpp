@@ -31,6 +31,14 @@ static void *heap_caps_malloc(size_t sz, int) { return malloc(sz); }
 static void  heap_caps_free(void *p) { free(p); }
 #define MALLOC_CAP_SPIRAM 0
 #define MALLOC_CAP_8BIT 0
+// Arduino's micros() shim, same standing as the two above. The cadence anchor in
+// tick_cb measures what one wake costs, and on the desktop that is measured against
+// the same monotonic clock the device uses — just this one by name.
+#include <time.h>
+static uint32_t micros() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL);
+}
 #endif
 #include <lvgl.h>
 #include <time.h>
@@ -893,7 +901,23 @@ static bool  s_layValid  = false;
 static int   s_layBuildY   = -1;      // next row to redo; <0 = not rebuilding
 static float s_layWantMin  = 0.0f;    // angles the in-progress rebuild is for
 static float s_layWantHr   = 0.0f;
+// Who is pushing an in-flight rebuild's bands forward: true = its own frames, inline
+// (the sweep, an animated background — how the slicing was hardware-verified); false =
+// the helper timer below, in the dead centre of the second, off the tick's path.
+static bool  s_laySpread   = false;
 static const int LAY_BAND  = SCREEN_H / 8;   // ~58 rows, so ~60 ms a frame instead of 470
+// A rebuild may only be SLICED while frames actually come fast enough to hide the seam —
+// see layers_spreadable. At or under this per-frame period the bands are tens of
+// milliseconds apart and the seam is the tolerance the layers already allow; above it, a
+// band lands once a SECOND, and eight of them put the minute hand on the glass in two
+// visible phases for eight seconds, resetting every ~3.5 s as the layers go stale again.
+// Greg, 2026-10-08, Aviator theme at 1 bps: the slicing built for the sweep, running on a
+// dial that has no sweep to protect.
+static const uint32_t LAY_SPREAD_MAX_MS = 400;
+// Where the tick is currently aimed. Defined up here because the layer cache's rebuild
+// cadence reads it; the sweep's own use of it is below, next to the beat accounting.
+static uint32_t s_tickPeriod = 0;
+static bool sweep_possible();                 // defined with the sweep's rules, far below
 // Set for one compose by the caller that knows the hands have not moved. compose_custom
 // then blits each layer at the exact point in the sequence its contents belong, instead of
 // running the four bilinear sprite passes. Anything else about the frame is unchanged.
@@ -955,6 +979,7 @@ static void layers_free() {
     if (s_layShadow) { heap_caps_free(s_layShadow); s_layShadow = nullptr; }
     if (s_layHand)   { heap_caps_free(s_layHand);   s_layHand   = nullptr; }
     s_layValid = false;
+    s_layBuildY = -1;   // a half-built layer must not survive its memory
 }
 
 // Both layers, for the minute and hour hands only, in the theme's own draw order.
@@ -1036,31 +1061,92 @@ static bool layers_build_rows(float minAng, float hrAng, int y0, int y1) {
     return true;
 }
 
+// Advance an in-flight rebuild by one band of rows. The unit of work both drivers share.
+static void lay_advance() {
+    if (s_layBuildY < 0) return;
+    if (!s_layShadow || !s_layHand) { s_layBuildY = -1; return; }   // freed mid-rebuild
+    const int upto = s_layBuildY + LAY_BAND - 1;
+    layers_build_rows(s_layWantMin, s_layWantHr, s_layBuildY, upto);
+    s_layBuildY = (upto >= SCREEN_H - 1) ? -1 : s_layBuildY + LAY_BAND;
+    if (s_layBuildY < 0) {                             // done: it is now a picture of those
+        s_layMinAng = s_layWantMin; s_layHrAng = s_layWantHr;
+        s_layValid = true;
+    }
+}
+
+// THE HELPER THAT RENEWS A TICKING DIAL'S HANDS BETWEEN TICKS, NOT DURING ONE.
+//
+// Lives for the life of the process, idle unless a slow caller's rebuild is in flight —
+// then it chews the eight bands on the loop task's idle time, ~60 ms a band at a ~10 ms
+// period, which the second's ~600 ms of dead centre comfortably swallows between two
+// boundary frames. Runs in the same task as the tick itself (both are LVGL timers), so
+// no lock exists between a compose reading the layer and this writing it: one finishes
+// strictly before the other starts.
+static lv_timer_t *s_layHelp = nullptr;
+static void lay_help_cb(lv_timer_t *t) {
+    (void)t;
+    if (s_layBuildY >= 0 && !s_laySpread) lay_advance();
+}
+
 // Keep a rebuild moving, or start one. Call once a frame.
 //
 // Returns whether there is anything worth blitting: after the first build there always is,
-// even mid-rebuild, which is the whole point of slicing it.
-static bool layers_tick(float minAng, float hrAng) {
+// even mid-rebuild — the rows not yet redone still hold the PREVIOUS picture, which the
+// tolerance already deems invisible, and the seam between it and the rows redone at the
+// new angle is the fraction of a pixel the hands travelled while the rebuild ran. That
+// sub-pixel seam is what the sweep has always shown mid-rebuild; it is not the fault.
+//
+// The spread is the caller's to decide, and it decides WHO PUSHES THE BANDS. A caller
+// whose frames come every few tens of milliseconds (the sweep, an animated background)
+// drives its rebuild inline, one band per frame — that is the arrangement the 2.16.71
+// hardware run verified, and it stays byte-identical. A caller drawing once a second
+// hands the bands to the helper above and pays NOTHING in the frame that noticed.
+//
+// What this replaces, in order, both Greg's reports of the same Aviator dial at 1 bps:
+//
+// The layers used to slice every rebuild unconditionally. On a dial that draws once a
+// second the eight bands took eight seconds, staleness arrived again at 3.5, and the
+// minute hand sat on the glass in two visible phases perpetually chasing its own
+// staleness — "the minute hand redraws in two phases every few seconds".
+//
+// The answer in 0d6c7a2 was to do the whole 470 ms renewal inside the frame that
+// noticed. The two phases went away; the second hand's step went with them — that
+// boundary frame came back half a second late, its move appearing while the click had
+// already sounded, then catching up. "The second hand hiccups and does not move and has
+// to catch up." The renewal was never too big for the second; it was too big for the
+// FRAME, and the frame is where the second hand lives.
+static bool layers_tick(float minAng, float hrAng, bool spread) {
     if (!s_layShadow || !s_layHand) {
         if (!layers_build(minAng, hrAng)) return false;   // allocates, or gives up for good
         s_layMinAng = minAng; s_layHrAng = hrAng; s_layValid = true; s_layBuildY = -1;
         return true;
     }
-    if (s_layBuildY >= 0) {                                // a slice of the rebuild in flight
-        layers_build_rows(s_layWantMin, s_layWantHr, s_layBuildY, s_layBuildY + LAY_BAND - 1);
-        s_layBuildY += LAY_BAND;
-        if (s_layBuildY >= SCREEN_H) {                     // done: it is now a picture of those
-            s_layMinAng = s_layWantMin; s_layHrAng = s_layWantHr;
-            s_layValid = true; s_layBuildY = -1;
-        }
-        return s_layValid;
+    if (s_layBuildY >= 0) {                        // a rebuild in flight...
+        if (spread && s_laySpread) lay_advance();  // ...a fast caller drives its own bands;
+        else if (!spread) s_laySpread = false;     // a cadence that turned slow mid-rebuild
+                                                   // hands the rest to the helper rather
+                                                   // than stall its next boundary frame
+        return s_layValid;                         // the previous picture is blitable
     }
-    if (!layers_usable(minAng, hrAng)) {                   // gone stale: start slicing
+    if (!layers_usable(minAng, hrAng)) {           // gone stale: slice it...
         s_layWantMin = minAng; s_layWantHr = hrAng;
         s_layBuildY = 0;
+        s_laySpread = spread;                      // ...and record who is driving
     }
     return s_layValid;
 }
+
+// May a rebuild be driven by the caller's own frames? True only where those frames come
+// fast enough that the seam between done rows and not-yet rows lasts milliseconds: the
+// sweep, which is what slicing was built for, and a ticking dial whose animated background
+// is driving the tick well under a second. Below that, the caller still gets a sliced
+// rebuild — driven by the helper between ticks instead — because a tick callback is the
+// one place on the device that has nothing to spare: see layers_tick.
+static bool layers_spreadable() {
+    if (sweep_possible()) return true;
+    return s_tickPeriod > 0 && s_tickPeriod < LAY_SPREAD_MAX_MS;
+}
+
 
 // Are the layers still a picture of where the hands are now?
 //
@@ -1723,7 +1809,7 @@ static void draw_custom(const struct tm *ti) {
     // turned far enough to matter, this falls through to exactly the compose it always did.
     const float minAng = minute_angle_now(ti);
     const float hrAng  = hour_angle_now(ti);
-    s_layUse = layers_tick(minAng, hrAng);
+    s_layUse = layers_tick(minAng, hrAng, layers_spreadable());
 #if defined(ESP_PLATFORM)
     const uint32_t t0 = micros();
     compose_custom(ti, -1, true);
@@ -1779,7 +1865,32 @@ static lv_timer_t *s_beat = nullptr;
 // A rolling average of what one sweep frame costs, in milliseconds, measured end to end
 // including everything LVGL then does with it.
 static float s_sweepMs = 45.0f;
-static uint32_t s_tickPeriod = 0;
+// s_tickPeriod moved up with the layer cache's rebuild cadence, which reads it.
+
+// CADENCE ACCOUNTING, added 2.16.72 because the four diagnoses before this one were
+// argued and this one is measured. Between the two wake-ups that draw the hand we record
+// how far the interval strayed from the beat grid, and count the shapes of failure that
+// matter to the eye:
+//
+//   early — a wake landed appreciably BEFORE the boundary it was aiming at. This is the
+//           2.16.71 fault: the hand drew the old beat, froze, and snapped back next frame.
+//   late  — a wake landed more than half a beat after it, which reads as a missed click.
+//   dup   — two wakes inside half a beat: one of them redrew the same angle. Invisible,
+//           but it is renderer effort spent on nothing, which is how the sweep starves.
+//   skip  — the gap between two drawn frames exceeded a beat and a half: the hand HELD
+//           still for a beat somebody could see. Not always a fault of the aiming — a
+//           470 ms recompose plans to skip — but every visible freeze is one of these,
+//           and whether the aim planned it is answerable from early/jitter alongside.
+//   jit   — signed spacing error against the beat grid, averaged and peaked, in ms. An
+//           even 120 ms frame rate at 8 beats reads smooth; 125 ± 60 ms reads like a
+//           stutter at the same average rate, which is the whole of Greg's 2026-10-06
+//           "better experience" comparison between 4 fps and a nominal 8.
+//
+// Cumulative since boot, reported on /health and to serial every 512 drawing wakes.
+#define BEAT_LEAD_MS 5   // never arm a wake under this; same floor as the audio beat's
+static uint32_t s_cadWakes = 0, s_cadEarly = 0, s_cadLate = 0, s_cadDup = 0, s_cadSkip = 0;
+static uint32_t s_cadJitSum = 0, s_cadJitN = 0, s_cadJitMax = 0;
+static long     s_cadLastUs = -1;   // wall µs within the minute at the last drawing wake
 
 // 30 a second is the ceiling: the hand turns six degrees a second, so a step is a fifth of a
 // degree, well under a pixel at the tip, and asking for more would spend the whole device on
@@ -1806,9 +1917,23 @@ static uint32_t s_tickPeriod = 0;
 // 21,600 watch should move like one. And when the design is too expensive to hold eight, it
 // drops to four rather than slipping: 14,400 is also a real movement, so the degraded case
 // still looks like a watch instead of looking like a struggling one.
-static int sweep_beat() {
+// THE BEAT IS LATCHED, AND READ, NEVER COMPUTED ON THE SPOT.
+//
+// It used to be recomputed on demand — once by the quantiser and once by the aim, in the
+// same frame, with a sweep_frame()'s EMA update landing between the two. A cost crossing
+// the threshold in that gap gave the angle eight beats a second and the timer four: the
+// hand moved every slot and was only looked at every other one. One recompute per tick
+// decides now — beat_recompute(), at the top of tick_cb — and everything in the frame
+// reads the same answer.
+static int s_beatNow = 8;
+
+static void beat_recompute() {
     const theme_style::Clock &cs = theme_style::clock();
-    if (cs.tickRate >= 2) return cs.tickRate;       // the theme owns its own movement
+    int want = s_beatNow;
+
+    if (cs.tickRate >= 2) {
+        want = cs.tickRate;                        // the theme owns its own movement
+    } else {
 
     // WHILE THE BACKGROUND IS MOVING, THE HAND KEEPS ITS TIME.
     //
@@ -1844,15 +1969,36 @@ static int sweep_beat() {
     const theme_style::Clock::BgAnim &ba = cs.bgAnim;
     if (ba.frames > 0 && (ba.loop || bg_anim_playing())) {
         int f = ba.fps < 1 ? 1 : ba.fps;
-        if (f >= 4) return f;              // already fast enough; stay exactly on it
-        int beat = f;
-        while (beat < 4) beat += f;        // smallest multiple of f that reaches four
-        return beat;
+        if (f < 4) { int m = f; while (m < 4) m += f; f = m; }   // smallest multiple >= 4
+        want = f;                        // in phase with the background, on its multiple
+    } else {
+        // THE COST TIER, NOW WITH A DEAD BAND.
+        //
+        // The single threshold at 110 ms let the decision flap: the rolling average of
+        // frame cost wanders by tens of milliseconds between the cheap frames and the
+        // expensive ones — a LAY_BAND slice, the minute cache expiring, a stray
+        // invalidate — and every crossing moved the dial between 28,800 and 14,400 bph
+        // MID-SWEEP, which is its own visible fault and was the fourth of these bugs.
+        // Degradation now has to be cheap to enter and expensive to leave: recover below
+        // 85 ms where degradation fires above 110, a band wide enough that ordinary
+        // wander cannot cross it twice in a row, so a rate change is a decision rather
+        // than an oscillation.
+        const float worst = 2.0f * s_sweepMs;
+        if (worst > 110.0f)      want = 4;   // 14,400 bph
+        else if (worst < 85.0f)  want = 8;   // 28,800 bph
+        // In between the two, want keeps s_beatNow. That is the hysteresis.
     }
-    // Two full frames of headroom, the same rule sweep_period() uses below.
-    if (s_sweepMs > 0.0f && s_sweepMs * 2.0f > 110.0f) return 4;   // 14,400 bph
-    return 8;                                                       // 28,800 bph
+    }
+    if (want != s_beatNow) {
+        s_beatNow = want;
+        // A beat that CHANGED is not a cadence fault, and the interval from the last
+        // wake to the next one straddles two grids. Drop the pending sample.
+        s_cadLastUs = -1;
+    }
 }
+
+// The only reader. Nobody asks the question of the cost any more; they read this answer.
+static int sweep_beat() { return s_beatNow; }
 
 // The hand's position, snapped back to the beat it is in.
 static float beat_quantize(float secs) {
@@ -1862,17 +2008,117 @@ static float beat_quantize(float secs) {
     return q;
 }
 
-// Milliseconds until the next beat, so a step lands ON it rather than near it.
-static uint32_t beat_aim() {
+// Milliseconds from a wake's FIRE INSTANT to arm the next one, so it lands ON the next
+// beat boundary — after it, never before it.
+//
+// PURE on purpose: no clock read, no globals, nothing to disagree with the quantiser.
+// The self-test walks it across every phase against the grid at every work cost the
+// renderer has been measured at, which is more than could be said for the version this
+// replaces. That one had four faults and they took a week:
+//
+//   * it read the clock ITSELF, after the frame had been drawn, and LVGL measures the
+//     period it is given from the stamp it took BEFORE the callback. Every wake was
+//     therefore early by the cost of its own drawing, and every swing in that cost —
+//     a background slice, the three-second minute rebuild — came out as a beat that
+//     arrived early, froze, and snapped. This is the sweeping cousin of the fault
+//     cddb3da fixed in aim_to_second(), and it is why the caller passes the usec of
+//     the instant the tick FIRED and the milliseconds spent since, instead of this
+//     function looking at the clock at all.
+//   * it truncated: integer division made the wait a fraction short of the boundary,
+//     so the wake landed before the second had rolled and drew the OLD beat. Rounded
+//     up now, the same way aim_to_second() was.
+//   * the "too close to chase" guard gave up on a beat that was about to happen and
+//     took the next one, adding a visible freeze exactly when a wake was doing well.
+//     A near wait now simply happens; a genuine overrun advances by WHOLE beats only,
+//     and only as many as the work actually needs.
+static uint32_t beat_wait_ms(long intoUs, long workedMs, int beat) {
+    if (beat <= 1) return 1000;
+    const long slotUs = 1000000L / beat;
+    long into = intoUs % slotUs;
+    if (into < 0) into += slotUs;
+    long waitUs = slotUs - into;                       // next boundary, from the fire instant
+    const long needUs = (workedMs + BEAT_LEAD_MS) * 1000L;
+    while (waitUs < needUs) waitUs += slotUs;          // overrun by WHOLE beats only
+    return (uint32_t)((waitUs + 999) / 1000);          // ROUNDED UP, never short
+}
+
+// fireUsec is tv_usec of the instant THIS wake fired — captured at the top of the
+// callback, BEFORE anything is drawn — and workedMs what this wake has spent so far.
+// Both readers of the beat — this aim and the quantiser below — read the same latched
+// sweep_beat(), so neither can move under the other mid-frame.
+static uint32_t beat_aim(uint32_t fireUsec, long workedMs) {
     const int b = sweep_beat();
     if (b <= 1) return 1000;
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    const long  slotUs = 1000000L / b;
-    const long  intoUs = (long)tv.tv_usec % slotUs;
-    uint32_t ms = (uint32_t)((slotUs - intoUs) / 1000);
-    if (ms < 5) ms += (uint32_t)(slotUs / 1000);   // too close to chase; take the next one
-    return ms;
+    return beat_wait_ms((long)fireUsec % (1000000L / b), workedMs, b);
+}
+
+// ONE function writes the drawing tick's period, and it is this one.
+//
+// Five call sites used to write s_tick directly, three of them gating themselves on a
+// single shared s_tickPeriod cache — so each treated a number written by a DIFFERENT
+// policy as already done and skipped its own, and whichever ran last in the tick won the
+// next wake. The sweep's beat aim, the background's rate request and the adaptive
+// frame-cost period were three clocks pretending to be one. Same fault as the re-aim
+// reconciliation in 7e4feca, finally applied to the branch that still had it.
+static void s_set_tick_period(uint32_t p) {
+    if (!s_tick || p == s_tickPeriod) return;
+    s_tickPeriod = p;
+    lv_timer_set_period(s_tick, p);
+}
+
+// Arm the next sweep frame, from the two numbers only the callback knows: the usec of
+// the instant it FIRED and the milliseconds it has spent since. The background's own
+// request is folded in here — the sooner of the two deadlines, the wait DIVIDED rather
+// than truncated, so one background frame still lands exactly on the second — because
+// the one writer has to own the whole decision. Two writers each "winning" is how the
+// hand and its click drifted half a second apart (Zion, 2026-10-07).
+static void arm_sweep_next(uint32_t fireUsec, long workedMs) {
+    uint32_t aim = beat_aim(fireUsec, workedMs);
+    const theme_style::Clock::BgAnim &ba = theme_style::clock().bgAnim;
+    if (ba.frames > 0 && (ba.loop || bg_anim_playing())) {
+        const uint32_t need = 1000u / (uint32_t)(ba.fps < 1 ? 1 : ba.fps);
+        if (need < aim) aim = aim_period(aim, need);   // divide the wait, never truncate
+    }
+    s_set_tick_period(aim);
+}
+
+// One interval measured, from the wall clock at the two FIRES, not from any timer's
+// notion of when it meant to run. Call it on every wake that DREW the hand, with the
+// sec/usec captured at the top of that wake, before any of its work.
+static void beat_cadence_sample(int sec, long usec) {
+    const int  beat   = s_beatNow;
+    const long slotUs = (beat <= 1) ? 1000000L : 1000000L / beat;
+    const long wallUs = (long)sec * 1000000L + usec;
+    if (s_cadLastUs >= 0) {
+        long d = wallUs - s_cadLastUs;
+        if (d < 0) d += 60L * 1000000L;                // the minute rolled under us
+        // Reject anything implausible rather than log it as a fault: a wake that waited
+        // seconds was not the beat (a covered screen, the minute rebuild storm), and a
+        // zero interval is the first sample after a re-arm.
+        if (d > 0 && d < 4L * 1000000L) {
+            s_cadWakes++;
+            const long rem = d % slotUs;
+            const long jit = (rem > slotUs / 2) ? rem - slotUs : rem;   // signed, to the grid
+            if (jit < -slotUs / 4) s_cadEarly++;
+            else if (jit > slotUs / 2) s_cadLate++;
+            if (d < slotUs / 2) s_cadDup++;
+            if (d > slotUs + slotUs / 2) s_cadSkip++;
+            const long aj = jit < 0 ? -jit : jit;
+            s_cadJitSum += (uint32_t)(aj / 1000);
+            s_cadJitN++;
+            if ((uint32_t)(aj / 1000) > s_cadJitMax) s_cadJitMax = (uint32_t)(aj / 1000);
+#if defined(ESP_PLATFORM)
+            if ((s_cadWakes & 511u) == 0)
+                Serial.printf("[sweep] cadence: %u wakes, beat %d, jitter avg %.1f ms max %u ms,"
+                              " early %u late %u dup %u skip %u (frame %.0f ms)\n",
+                              s_cadWakes, s_beatNow,
+                              (float)s_cadJitSum / (float)(s_cadJitN ? s_cadJitN : 1),
+                              s_cadJitMax, s_cadEarly, s_cadLate, s_cadDup, s_cadSkip,
+                              s_sweepMs);
+#endif
+        }
+    }
+    s_cadLastUs = wallUs;
 }
 
 static uint32_t sweep_period() {
@@ -2494,7 +2740,13 @@ static void sweep_frame(float secs) {
             // Order is unchanged from what this loop already did. It draws shadow-then-hand
             // per hand, so the second hand is already underneath the minute and hour shadows
             // here; laying the shadow layer and then the hand layer keeps that.
-            const bool layered = layers_tick(above[1], above[0]);
+            // A sweep frame is by definition a fast frame — the beat it is stepping at is
+            // at least a beat a second, and the aim will not schedule one any slower than
+            // that — so the rebuild this starts is driven INLINE, a band per sweep frame:
+            // eight bands across eight tens-of-milliseconds frames, the seam between them
+            // the sub-pixel fraction of a degree the tolerance already covers. This is
+            // the arrangement the 2.16.71 hardware run verified, unchanged.
+            const bool layered = layers_tick(above[1], above[0], true);
             if (layered) {
                 if (cs.shadowOn) lay_blit(s_layShadow);
                 lay_blit(s_layHand);
@@ -2553,11 +2805,12 @@ static void sweep_frame(float secs) {
     {
         const uint32_t took2 = micros() - t0;
         if (took2 < 400000UL) s_sweepMs += 0.1f * ((float)took2 / 1000.0f - s_sweepMs);
-        const uint32_t want = sweep_period();
-        if (s_tick && want != s_tickPeriod) {
-            s_tickPeriod = want;
-            lv_timer_set_period(s_tick, want);
-        }
+        // AND THAT IS ALL THIS DOES. It used to set the tick's period from here — the
+        // average of the work it had just measured, which the beat aim was setting from
+        // the fire instant at the same time, so the frame cost measured BELOW fed the
+        // period written AFTER the aim had computed its own, and the timer woke at
+        // whoever wrote last. The measurement still matters — it decides the beat latch —
+        // but the schedule belongs to arm_sweep_next(), and to nothing else.
     }
 #endif
 }
@@ -2691,7 +2944,12 @@ static void retime(void) {
     // is a quarter of the work of a busy one — with a fifth on top so the timer, not the
     // renderer, decides when frames happen. That is radar_view's rule about even arrival,
     // applied without having to guess the number.
-    lv_timer_set_period(s_tick, sweep_possible() ? sweep_period() : 1000);
+    // COARSE arming, for the moment before the first beat: the first wake lands wherever
+    // this puts it, and the wake itself then takes over from arm_sweep_next() for as long
+    // as the dial sweeps. The one exception to the single writer is that this runs from
+    // OUTSIDE the callback — theme applied, sweep toggled — where the beat cannot aim
+    // itself because nothing is firing.
+    s_set_tick_period(sweep_possible() ? sweep_period() : 1000);
 }
 
 // One click a second, from whichever set the worn theme shipped. Nothing else.
@@ -2771,6 +3029,19 @@ static void tick_cb(lv_timer_t * /*t*/) {
     // somebody spent winding, with all of it discarded because a hidden object's
     // invalidation is dropped. It was the whole of the hitch.
     if (orb_screen_covered()) return;
+    // THE CADENCE ANCHOR — captured HERE, before anything is drawn, by both clocks:
+    // the wall one for which beat to answer, and the monotonic one for what this wake
+    // has spent by the time it arms the next. LVGL stamps the timer's last_run just
+    // before calling us and measures the period we set from that stamp, so every arm
+    // below reckons from THIS instant. Reading the clock after the drawing instead —
+    // which is what 3bc1209's beat_aim did, and was the whole of the sweeping jitter:
+    // every frame early by the cost of the frame before it, every cost swing a
+    // step-size swing.
+    struct timeval tvFire; gettimeofday(&tvFire, nullptr);
+    const uint32_t tFire = micros();
+    // One beat decision for the whole wake, before the quantiser or the aim can ask:
+    // they must not see different movements in the same frame.
+    beat_recompute();
     struct tm ti;
     time_for_face(&ti);
 
@@ -2823,7 +3094,13 @@ static void tick_cb(lv_timer_t * /*t*/) {
             const uint32_t need = (uint32_t)(1000 / (a2.fps < 1 ? 1 : a2.fps));
             uint32_t want2 = base;
             if (running) { want2 = bg_rate(need, base, s_bgEvery); } else { s_bgEvery = 1; }
-            if (want2 != s_tickPeriod) { s_tickPeriod = want2; lv_timer_set_period(s_tick, want2); }
+            // A sweeping dial does not take its rate from here at all: while the sweep
+            // runs, the beat aim at the foot of this same callback owns the timer — see
+            // arm_sweep_next — and the background's request reaches it from THERE,
+            // divided to land on the second rather than merely fast. A second writer
+            // with its own idea of "already set" is how the sweep got its stutter;
+            // this one still speaks for the dials that do not sweep.
+            if (!sweep_possible()) s_set_tick_period(want2);
         }
         ++s_bgTick;
     }
@@ -2901,14 +3178,34 @@ static void tick_cb(lv_timer_t * /*t*/) {
 #endif
                 if (moved) {
                 sweep_pad_for_shadow();
-                sweep_frame(railway_seconds(wall));
+                // ON THE BEAT, AND AIMED AT THE NEXT ONE, LIKE EVERY OTHER SWEEP FRAME.
+                //
+                // This call site predates the beat machinery and never got it: it drew
+                // the hand at the UNQUANTISED wall second and returned without re-arming,
+                // so every in-place minute move — once a minute on a railway dial, every
+                // couple of seconds where the hand creeps — landed an off-grid angle on
+                // whatever frame the cached period happened to deliver, and the next beat
+                // frame snapped back to the grid. A perfectly regular sweep that hitched
+                // on a fixed schedule, which is what the report said and what no reading
+                // of the sweep loop itself could find.
+                sweep_frame(railway_seconds(beat_quantize(wall)));
+                arm_sweep_next((uint32_t)tvFire.tv_usec, (long)((micros() - tFire) / 1000UL));
+                beat_cadence_sample(ti.tm_sec, (long)tvFire.tv_usec);
                 return;
                 }
             }
 #if defined(ESP_PLATFORM)
             const uint32_t c0 = micros();
 #endif
-            if (!rebuild_under(&ti)) { redraw(&ti); return; }
+            if (!rebuild_under(&ti)) { redraw(&ti);
+                // This fallback draws the whole face — second hand included — and it was
+                // the one drawn frame nobody aimed: on a design whose under-cache keeps
+                // failing, every rebuild attempt ended here and left the tick at whatever
+                // period the last successful path had settled on. Every full-face draw is
+                // a beat frame and gets the same arm the fast paths give theirs.
+                arm_sweep_next((uint32_t)tvFire.tv_usec, (long)((micros() - tFire) / 1000UL));
+                beat_cadence_sample(ti.tm_sec, (long)tvFire.tv_usec);
+                return; }
 #if defined(ESP_PLATFORM)
             // Same shape as the sweep's own meter below: the WORK, not the gap between
             // frames, so it cannot feed back into the period that schedules it.
@@ -2951,10 +3248,6 @@ static void tick_cb(lv_timer_t * /*t*/) {
         // Snapped to the beat (see sweep_beat): the hand holds a position for a whole beat
         // and then moves, which is what an escapement does and what the eye reads as even.
         sweep_frame(railway_seconds(beat_quantize(wall)));
-        // ...and the next frame is aimed AT the next beat, not merely scheduled soon. A step
-        // that is regular to the millisecond reads as smooth at eight a second; the same step
-        // arriving whenever the renderer happens to finish reads as a stutter, which is the
-        // whole of what "a beat jerky" was.
         // THE HAND AND THE BACKGROUND ARE NOT ON THE SAME CLOCK, and they should not be.
         //
         // A watch's hand beats continuously while its wheels barely turn, and that is the
@@ -2969,36 +3262,28 @@ static void tick_cb(lv_timer_t * /*t*/) {
         // sooner rather than letting the last writer win is the same lesson as the re-aim on
         // the non-sweep path: this clobbered the bgAnim block's request for one build, and
         // got away with it only because the theme happened to ask for four of each.
-        if (s_tick) {
-            uint32_t aim = beat_aim();
-            const theme_style::Clock::BgAnim &ba = theme_style::clock().bgAnim;
-            if (ba.frames > 0 && (ba.loop || bg_anim_playing())) {
-                const uint32_t need = 1000u / (uint32_t)(ba.fps < 1 ? 1 : ba.fps);
-                if (need < aim) {
-                    // DIVIDE THE WAIT, do not truncate it.
-                    //
-                    // Taking the smaller of the two threw the aim away. The line above had
-                    // just worked out how long until the real second, which is where the hand
-                    // steps and where the click fires; replacing it with the background's
-                    // period put the frames on a cadence with no relation to the second at
-                    // all. On a ticking dial the hand then moved on whichever of those frames
-                    // happened to cross the boundary first, so it landed up to a whole
-                    // background period after its own sound. At two frames a second that is
-                    // half a second of daylight between the hand and the click.
-                    //
-                    // Zion, 2026-10-07, having turned the sweep off to save frame rate: "the
-                    // hand and audio don't match in their timing". Turning the sweep OFF is
-                    // what exposed it, because a sweeping dial ticks every 77 ms and lands
-                    // near enough the second either way.
-                    //
-                    // Dividing gives the background at least the rate it asked for AND puts
-                    // one of those frames exactly on the second. Same fix as the looping
-                    // background's own stutter, in the branch that was missed.
-                    aim = aim_period(aim, need);
-                }
-            }
-            if (aim != s_tickPeriod) { s_tickPeriod = aim; lv_timer_set_period(s_tick, aim); }
-        }
+        // ...and the next frame is aimed AT the next beat, not merely scheduled soon. A
+        // step that is regular to the millisecond reads as smooth at eight a second; the
+        // same step arriving whenever the renderer happens to finish reads as a stutter,
+        // which was the whole of what "a beat jerky" was.
+        //
+        // Both numbers come from the top of THIS callback: the usec it fired at, and
+        // what it has cost so far. That second one is why the aim was wrong for a
+        // release — it asked how far the boundary was from NOW, after the drawing, so
+        // the wake arrived early by exactly its own cost, and a theme whose frames
+        // alternate cheap-expensive-cheap got intervals that alternated the same way
+        // around the grid. Subtracting the work from the FIRE INSTANT makes the next
+        // wake's timing independent of this wake's cost; a frame that cannot be
+        // subtracted into its slot takes a WHOLE extra beat, which is a slower sweep,
+        // and never a freeze, which is the visible fault. The background's request is
+        // folded in by arm_sweep_next — the sooner of the two deadlines, the wait
+        // DIVIDED rather than truncated, so a background frame still lands exactly on
+        // the second beside its click.
+        arm_sweep_next((uint32_t)tvFire.tv_usec, (long)((micros() - tFire) / 1000UL));
+        // What actually happened, measured between two fires by the wall clock, not
+        // what the timer intended. Early counts must stay at zero; skip counts are
+        // the freezes, and are answerable from whether the aim planned them.
+        beat_cadence_sample(ti.tm_sec, (long)tvFire.tv_usec);
         return;
     }
     // The FACE still moves once a second even when the sound beats faster. A watch running at
@@ -3022,7 +3307,10 @@ static void tick_cb(lv_timer_t * /*t*/) {
     // Re-aimed every frame rather than set once, because the device's clock and LVGL's timer
     // are not the same clock and will drift apart over hours.
     if (s_tick && !sweep_possible()) {
-        struct timeval tv; gettimeofday(&tv, nullptr);
+        // Aimed from the FIRE INSTANT captured at the top of this callback, like the
+        // sweep's, rather than from a fresh read after the redraw — which is still a
+        // frame-cost-sized phase error between the hand and its click, steady while
+        // the face costs the same twice running and a jitter whenever it does not.
         // ROUNDED UP, AND NEVER SKIPPED. Both halves of this were wrong and both put the
         // hand behind its own click.
         //
@@ -3040,7 +3328,7 @@ static void tick_cb(lv_timer_t * /*t*/) {
         // floor, which is the same floor the audio beat uses.
         //
         // Zion, after three wrong diagnoses from me: "the audio and hands don't line up".
-        uint32_t ms = aim_to_second((uint32_t)tv.tv_usec);
+        uint32_t ms = aim_to_second((uint32_t)tvFire.tv_usec);
         // ...but never out-wait a background that is mid-play.
         //
         // This used to set the period unconditionally, and the bgAnim block at the top of
@@ -3060,7 +3348,7 @@ static void tick_cb(lv_timer_t * /*t*/) {
             const uint32_t need = 1000u / (uint32_t)(ba.fps < 1 ? 1 : ba.fps);
             if (need < ms) ms = need;   // the sooner of the two deadlines
         }
-        lv_timer_set_period(s_tick, ms);
+        s_set_tick_period(ms);
     }
 }
 
@@ -3297,6 +3585,44 @@ long  clockview::beatSlot(long sec, long usec, int beat) {
 }
 bool  clockview::stepAffordable(float composeMs) { return step_affordable(composeMs); }
 
+// The hand-layer cache's rebuild cadence, for the self-test. layersTick takes one frame
+// of the upkeep the real callers take; layersRebuilding answers the question the bug
+// report asks — is the minute hand right now a picture of two different angles at once,
+// rows above the band boundary moved and rows below it have not — and layersForceStale
+// ages the cache the way a creeping minute hand does, one pixel at the tip, without the
+// test having to stand there for three and a half seconds waiting for the angle to drift
+// past the tolerance on its own. (A 30-degree nudge, not a sentinel: an absurd angle would
+// be folded back inside the tolerance by the same 360-degree wrap that keeps 359.9 and 0.1
+// friends.) layersPump advances an in-flight rebuild by the band the helper timer would
+// take, without the test waiting on a timer that fires on the LVGL tick; it exists for the
+// same reason the helper does — the boundary frame that notices a stale layer must spend
+// nothing on it beyond setting the rebuild up.
+bool  clockview::layersTick(float minAng, float hrAng, bool spread) { return layers_tick(minAng, hrAng, spread); }
+bool  clockview::layersRebuilding() { return s_layBuildY >= 0; }
+void  clockview::layersForceStale() { s_layMinAng += 30.0f; s_layHrAng += 30.0f; }
+void  clockview::layersPump() { lay_advance(); }
+
+// The sweep's beat arithmetic for the self-test — PURE, and the whole point is that it
+// can be: the wait given a fire phase against the grid, the milliseconds the wake has
+// spent, and the latched beat. The 2.16.71 walk of this grid failed three of its
+// assertions from every phase (truncation, the chase-skip, and the post-work anchor);
+// see the tests beside clockview::beatAim in sim_main.
+uint32_t clockview::beatWait(long intoUs, long workedMs, int beat) {
+    return beat_wait_ms(intoUs, workedMs, beat);
+}
+
+void clockview::cadence(Cadence &out) {
+    out.wakes    = s_cadWakes;
+    out.early    = s_cadEarly;
+    out.late     = s_cadLate;
+    out.dup      = s_cadDup;
+    out.skip     = s_cadSkip;
+    out.jitAvgMs = s_cadJitN ? s_cadJitSum / s_cadJitN : 0;
+    out.jitMaxMs = s_cadJitMax;
+    out.beat     = s_beatNow;
+    out.frameMs  = s_sweepMs;
+}
+
 void clockview::setSweep(int mode) {
     s_forceSweep = mode;
     s_underMin = -1; s_underHr = -1; s_underMins = -1.0f; s_prevSecValid = false;
@@ -3470,6 +3796,11 @@ void clockview::init() {
     // would play the set twice a second, half a beat apart, which would sound exactly like
     // the stutter it is here to remove.
     if (!s_beat) s_beat = lv_timer_create(beat_cb, 20, nullptr);
+    // Same guard, same reason, for the layer-renewal helper: it exists so a dial that
+    // draws once a second can renew its cached hands in the dead centre of the second
+    // instead of inside the boundary frame that has to move the second hand. Idle
+    // (returning at once) unless a slow caller's rebuild is in flight.
+    if (!s_layHelp) s_layHelp = lv_timer_create(lay_help_cb, 10, nullptr);
     retime();
 }
 

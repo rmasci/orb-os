@@ -92,7 +92,43 @@ namespace clockview {
     // How long the tick's own timer waits, from a given point in the second. Exposed because
     // the whole value of that timer is that it lands on the second and nothing else.
     uint32_t  beatAim(long usec);
+    // The SWEEP's beat arithmetic, for the self-test. Milliseconds from a wake's fire
+    // instant until the next one, given how far past a beat boundary the wake fired
+    // (intoUs), what it has spent so far (workedMs), and the beat it is stepping at.
+    // Three rules the 2.16.71 version broke, all checkable without a clock: the wake
+    // never lands before its work finished, never before a beat boundary, and never a
+    // whole beat later than the first boundary its work clears.
+    uint32_t  beatWait(long intoUs, long workedMs, int beat);
+    // Cadence accounting since boot, for /health: what the interval between drawn
+    // frames actually did, not what the timer intended. frameMs is the rolling cost
+    // of one, beat the latched rate it is stepping at.
+    struct Cadence {
+        uint32_t wakes, early, late, dup, skip;
+        uint32_t jitAvgMs, jitMaxMs;
+        int      beat;
+        float    frameMs;
+    };
+    void      cadence(Cadence &out);
     // Whether a design whose full compose costs this many milliseconds can afford to animate
     // the minute hand's step, rather than clicking it over in one move.
     bool      stepAffordable(float composeMs);
+    // The hand-layer cache's rebuild cadence, for the self-test. A dial that draws one
+    // frame a second must spend NOTHING on a stale layer's rebuild in the frame that
+    // notices: the ~470 ms of band work belongs in the dead centre of the second, chewed
+    // through by a helper timer between ticks, while the previous in-tolerance picture
+    // keeps the glass filled. Slicing it across eight of those once-a-second frames put
+    // the minute hand on the glass in two visible phases forever (Aviator at 1 bps,
+    // 2026-10-08); running it whole inside the boundary frame hiccupped the second hand
+    // half a second behind its own click five minutes later. A fast caller — the sweep,
+    // an animated background — still drives its rebuild's bands inline, one per frame.
+    //
+    // layersTick takes one frame of the upkeep with the spread decided FOR the caller (the
+    // real callers ask layers_spreadable()); layersRebuilding says whether a sliced rebuild
+    // is in flight; layersForceStale ages the cache the way the creeping minute hand
+    // would; layersPump advances an in-flight rebuild by the band the helper timer would
+    // take, without the test waiting on a timer.
+    bool      layersTick(float minAng, float hrAng, bool spread);
+    bool      layersRebuilding();
+    void      layersForceStale();
+    void      layersPump();
 }

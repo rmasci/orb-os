@@ -18,6 +18,50 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.00
+
+- The Orb stops running out of memory. This is what sits behind the theme sends that stop
+  part way, the install page that will not load, the page at theorb.local that stops
+  answering, and the feeds that go quiet after a long uptime. Diagnosed by Greg Takacs,
+  measured and fixed first by Techtobi83
+- The second hand sweeps evenly instead of jerking its way around the dial, and on a
+  ticking clock the minute hand no longer appears in two pieces or pushes the second hand
+  out of step. Found and fixed by Greg Takacs
+- A theme with a long name finds its own artwork, so a freshly installed theme no longer
+  comes up missing its background with the hands off center. Reported by biker_trash_1340
+- Animated backgrounds keep animating and hold every frame for the same length of time,
+  and the radar sweep moves evenly
+
+This is a new baseline: everything since the last published version, in one release.
+Merged by CanadianAvenger, with most of the firmware work by Greg Takacs.
+
+---
+
+## 2.16.71
+
+- The second hand on a sweeping clock no longer jerks its way around the dial. Its
+  wake-up was timed from when the previous frame FINISHED rather than when it began, so
+  every frame arrived early by the cost of drawing it, and every expensive frame — a
+  background slice, the minute hand's creep — pushed the next few beats out of step.
+  The wait is now measured from the wake itself and rounded up, a beat is only ever
+  given up whole, the hand's own rate stops flapping between 28,800 and 14,400 bph
+  mid-sweep, and the minute-hand refresh that had been stepping off the beat grid now
+  keeps it like every other frame. /health gained sweep_jitter_ms and a freeze count,
+  so the next argument about this is settled with measurements
+- The minute hand on a ticking (non-sweeping) clock no longer appears in two pieces every
+  few seconds, and no longer hiccups the second hand when it moves. Its cached picture
+  renewed itself in eight slices spread over eight frames — a sweep's answer, wrong for a
+  dial that draws once a second, where the half-renewed hand sat on the glass and the
+  renewal never finished before it went stale again; doing it all in the frame that
+  noticed instead held the second hand's step half a second behind its own click. The
+  renewal now happens whole between ticks, on the loop's idle time, while the previous
+  picture keeps the glass filled; sweeping and animated dials are unchanged
+- Found in Greg's 2026-10-07 report of the sweeping second hand and his 2026-10-08 report
+  of the Aviator dial's two-phase minute hand, and the fix that four earlier diagnoses
+  could not reach
+
+---
+
 ## 2.16.70
 
 - A ticking second hand moves with its own click instead of a second behind it. The wait for

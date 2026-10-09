@@ -70,11 +70,12 @@
 // 628-byte largest block, 50x worse than the 67 KB / 31.7 KB this file calls healthy, and
 // the honest answer to "is that LVGL?" was a shrug.
 //
-// Compile the whole thing out with -DORB_LV_STATS=0 if the hot path ever needs to be clean;
+// Compile the whole thing in with -DORB_LV_STATS=1 if needed for debugging, deployments should
+// leave this at 0.
 // it costs a bucket index and a few increments per allocation, and one
 // heap_caps_get_allocated_size() call per free.
 #ifndef ORB_LV_STATS
-#define ORB_LV_STATS 1
+#define ORB_LV_STATS 0
 #endif
 
 #define ORB_LV_NBUCKETS 8

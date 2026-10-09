@@ -1473,6 +1473,56 @@ int main(int argc, char **argv) {
                        " (%d early, %d overshooting)\n", !early && !far ? "PASS" : "FAIL", early, far);
             }
 
+            // THE SECOND HAND NEVER WAITS FOR A RENEWING HAND LAYER.
+            //
+            // The hand layers cache the minute and hour hands, and the renewal costs
+            // ~470 ms of blending. WHERE that lands is the entire design question, and
+            // two wrong answers came from the same dial: sliced unconditionally, the
+            // eight bands of a once-a-second Aviator took eight seconds, staleness
+            // arrived again at 3.5, and the minute hand sat on the glass in two visible
+            // phases chasing its own tail — "the minute hand redraws in two phases every
+            // few seconds" (Greg, 2026-10-08). Run whole inside the frame that noticed —
+            // the 0d6c7a2 answer — and that boundary frame came back half a second late:
+            // "the second hand hiccups and does not move and has to catch up". The
+            // renewal belongs NEITHER in the boundary frame NOR across eight of them:
+            // a slow dial starts the slice and a helper chews it on the loop task's idle
+            // time, the previous in-tolerance picture keeping the glass filled meanwhile.
+            {
+                bool old_shown = true, started = true, helper_done = true;
+                bool inline_fast = true, turned_slow = true;
+                clockview::layersTick(40.0f, 220.0f, false);        // get the layers built
+                for (int i = 0; i < 32 && clockview::layersRebuilding(); ++i)
+                    clockview::layersPump();
+                clockview::layersForceStale();
+                // The frame that notices pays for setting the rebuild up and nothing
+                // else: it still gets a whole layer to blit — the previous one.
+                if (!clockview::layersTick(40.4f, 220.0f, false)) old_shown = false;
+                if (!clockview::layersRebuilding()) started = false;   // started, NOT stalled
+                for (int i = 0; i < 32 && clockview::layersRebuilding(); ++i)
+                    clockview::layersPump();                     // the helper chews it
+                if (clockview::layersRebuilding()) helper_done = false;   // in a few bands
+                clockview::layersForceStale();                   // the sweep still drives
+                clockview::layersTick(41.0f, 220.2f, true);                // its OWN bands,
+                for (int i = 0; i < 32 && clockview::layersRebuilding(); ++i)
+                    clockview::layersTick(41.0f, 220.2f, true);            // one a frame
+                if (clockview::layersRebuilding()) inline_fast = false;
+                clockview::layersForceStale();                   // and a cadence that
+                clockview::layersTick(41.4f, 220.3f, true);                // turns slow
+                clockview::layersTick(41.4f, 220.3f, false);               // mid-rebuild
+                for (int i = 0; i < 32 && clockview::layersRebuilding(); ++i)
+                    clockview::layersPump();                               // hands off
+                if (clockview::layersRebuilding()) turned_slow = false;    // without a stall
+                printf("[selftest] a once-a-second dial renews its hand layers off the "
+                       "tick's path: %s (previous picture stays on the glass: %s, started "
+                       "not stalled: %s, the helper finishes it: %s, the sweep still drives "
+                       "its own: %s, a cadence turning slow mid-rebuild lands off-path: %s)\n",
+                       old_shown && started && helper_done && inline_fast && turned_slow
+                           ? "PASS" : "FAIL",
+                       old_shown ? "yes" : "NO", started ? "yes" : "NO",
+                       helper_done ? "yes" : "NO", inline_fast ? "yes" : "NO",
+                       turned_slow ? "yes" : "NO");
+            }
+
             // A TICKING HAND LANDS WITH ITS OWN CLICK, even while a background plays.
             //
             // The click is scheduled against the real second. The hand moves when the drawing
@@ -1624,6 +1674,62 @@ int main(int argc, char **argv) {
                 printf("[selftest] the tick's timer lands on the second: %s"
                        " (at worst %ld ms late, %ld ms early, and wakes %ld time a second)\n",
                        aimed ? "PASS" : "FAIL", latest / 1000, -earliest / 1000, wakes);
+            }
+
+            // 2.16.72: THE SWEEP'S OWN BEAT, over every phase against the grid and every
+            // frame cost the renderer has actually been measured at (13 ms plain hand,
+            // 130 with the glass and shadows, 470 for the minute rebuild that stops
+            // everything). Four rules, and the version this replaced failed all four
+            // from some phase or another — which is why the hand jerked and four
+            // diagnoses could not find it:
+            //   the wake never lands before its own work has finished plus the floor,
+            //   it never lands BEFORE a beat boundary (the freeze-and-snap, the visible
+            //     fault — the truncation lost up to a whole millisecond and the
+            //     boundary arrived after the draw),
+            //   it never wastes a beat: at most one extra slot beyond what the work
+            //     clears, where the old "too close to chase" guard added a whole one
+            //     whenever the wake was doing WELL and about to catch the next beat,
+            //   and in steady state, whatever the cost, the interval is EXACTLY one
+            //     slot. That is the whole meaning of "no sweeping jitter" — the old
+            //     aim, measured from the end of the frame, produced slot + work(n-1)
+            //     - work(n), an even rate only while every frame cost the same.
+            {
+                const long WORK[] = { 0, 13, 40, 60, 110, 130, 470 };
+                const int  NWORK  = (int)(sizeof(WORK) / sizeof(WORK[0]));
+                long before = 0, wasted = 0, offGrid = 0, cases = 0;
+                bool steadyEven = true;
+                for (int bi = 0; bi < 2; ++bi) {
+                    const int  beat   = bi ? 4 : 8;
+                    const long slotUs = 1000000L / beat;
+                    for (long us = 0; us < 1000000L; us += 37) {
+                        const long into = us % slotUs;
+                        for (int wi = 0; wi < NWORK; ++wi) {
+                            const long w    = WORK[wi];
+                            const long wait = (long)clockview::beatWait(into, w, beat);
+                            cases++;
+                            if (wait < w + 5)                                 before++;
+                            if (wait > w + 5 + slotUs / 1000L + 1L)           wasted++;
+                            const long past = (into + wait * 1000L) % slotUs;
+                            if (past > 1000L)                                 offGrid++;
+                        }
+                    }
+                    // Steady state at 40 ms a frame: after the first couple of beats
+                    // settle, every interval must be one slot on the nose.
+                    long at = 12345L;   // an arbitrary phase; the device never starts on-grid
+                    for (int k = 0; k < 4; ++k)
+                        at += (long)clockview::beatWait(at % slotUs, 40, beat) * 1000L;
+                    for (int k = 0; k < 40; ++k) {
+                        const long wait = (long)clockview::beatWait(at % slotUs, 40, beat) * 1000L;
+                        if (wait != slotUs) { steadyEven = false; break; }
+                        at += wait;
+                    }
+                }
+                const bool beatTight = before == 0 && wasted == 0 && offGrid == 0 && steadyEven;
+                printf("[selftest] the sweep's beat lands on the grid: %s"
+                       " (%ld cases: %ld before work, %ld wasted a beat, %ld off grid,"
+                       " steady cadence %s)\n",
+                       beatTight ? "PASS" : "FAIL", cases, before, wasted, offGrid,
+                       steadyEven ? "even" : "UNEVEN");
             }
             }
         }
