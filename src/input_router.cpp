@@ -1,5 +1,6 @@
 #include "input_router.h"
 #include "knob_help.h"
+#include "popup_notice.h"
 #include "wind_notice.h"
 #include "update_ui.h"
 #include <lvgl.h>       // lv_tick_get — a millisecond clock both targets have
@@ -141,6 +142,10 @@ void input_router::dispatch(int delta, bool pressed) {
     // notice above and for the same reason: any input clears it, and that input is
     // SWALLOWED. Letting the dismissing press through would hand it straight back to the
     // screen that ignored it, which is the silence this panel exists to break.
+    if (popup_notice::showing()) {
+        if (pressed || delta != 0) popup_notice::dismiss();
+        return;
+    }
     if (knob_help::showing()) {
         if (pressed || delta != 0) knob_help::dismiss();
         return;

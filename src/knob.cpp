@@ -30,11 +30,10 @@ static constexpr uint32_t ROCK_MIN_GAP_MS = 45;
 static constexpr uint32_t ROCK_QUICK_MS   = 250;
 static constexpr uint32_t ROCK_MAX_GAP_MS = 900;
 
-static constexpr uint32_t SW_DEBOUNCE_MS = 200;  // min time between accepted presses. Wide on purpose:
-                                                  //   this switch bounces heavily, and 200ms is still far
-                                                  //   faster than anyone deliberately selects menu items,
-                                                  //   so one physical click can't become two/three.
-static constexpr uint32_t LONG_PRESS_MS  = 8000;   // hold to force a recovery reboot (long enough
+static constexpr uint32_t SW_DEBOUNCE_MS        = 300;  // min time between accepted presses
+static constexpr uint32_t SW_RELEASE_MIN_MS     = 80;   // min release time before accepting next press (blocks release bounce)
+static constexpr uint32_t SW_PRESS_HOLD_MIN_MS  = 30;   // min hold time before accepting release (blocks downstroke chatter)
+static constexpr uint32_t LONG_PRESS_MS         = 8000; // hold to force a recovery reboot (long enough
                                                     // that incidental contact while touching the
                                                     // screen next to the knob can't trigger it)
 
@@ -82,9 +81,9 @@ static volatile bool s_pendingLong  = false;
 // the instant it happens even if the main loop is busy (e.g. Spy Cam decoding a
 // frame). Polling digitalRead() once per loop() can miss a press-and-release that
 // both happen inside one slow loop iteration; a hardware interrupt cannot.
-static volatile uint32_t s_swLastEdgeMs  = 0;
-static volatile uint8_t  s_swLevel       = HIGH;
+static volatile uint8_t  s_swLevel        = HIGH;
 static volatile uint32_t s_swPressStartMs = 0;
+static volatile uint32_t s_swReleaseMs    = 0;
 static volatile bool     s_swLongFired    = false;
 
 // Standard rotary-encoder quadrature decode table (Ben Buxton style). Index is
@@ -174,28 +173,37 @@ static void IRAM_ATTR knob_isr() {
     while (s_anchor - s_rawPos >= KNOB_STEPS_PER_DETENT) { s_anchor -= KNOB_STEPS_PER_DETENT; on_detent(-1); }
 }
 
-// Debounced in the ISR. A RELEASE (rising edge) is always accepted so s_swLevel can
-// never get "stuck" LOW (an earlier bug counted a phantom hold toward the long-press
-// reboot) — but it MUST also stamp s_swLastEdgeMs. That's the key: without stamping
-// the release, the switch's release bounce (open/closed/open) produced falling edges
-// that landed >SW_DEBOUNCE_MS after the original press and each registered as a NEW
-// press, so one physical click typed 2-3 characters. A PRESS (falling edge) is only
-// accepted once SW_DEBOUNCE_MS has passed since ANY edge (press or release), which
-// rejects both press bounce and the tail of a just-released button.
+// Debounced in the ISR using a two-state machine with hysteresis and edge timing:
+// - While PRESSED (LOW):
+//   Ignores any LOW edges. A rising edge (release) is only accepted after SW_PRESS_HOLD_MIN_MS,
+//   which completely suppresses contact chatter during the initial down-stroke.
+// - While RELEASED (HIGH):
+//   Ignores any HIGH edges. A falling edge (press) is only accepted if:
+//   1. The switch has been released for at least SW_RELEASE_MIN_MS (swallowing release bounce).
+//   2. At least SW_DEBOUNCE_MS has elapsed since the start of the previous press.
+// Uses esp_timer_get_time() because this ISR runs from IRAM.
 static void IRAM_ATTR knob_sw_isr() {
-    const uint32_t now = millis();
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     const uint8_t lvl = (uint8_t)digitalRead(PIN_KNOB_SW);
-    if (lvl == HIGH) {
-        s_swLevel = HIGH;           // release: trust instantly, never gets "stuck"...
-        s_swLastEdgeMs = now;       // ...but timestamp it so the release bounce is debounced too
-        return;
+
+    if (s_swLevel == LOW) {
+        if (lvl == HIGH) {
+            if (now - s_swPressStartMs >= SW_PRESS_HOLD_MIN_MS) {
+                s_swLevel = HIGH;
+                s_swReleaseMs = now;
+            }
+        }
+    } else {
+        if (lvl == LOW) {
+            if ((now - s_swReleaseMs >= SW_RELEASE_MIN_MS) &&
+                (now - s_swPressStartMs >= SW_DEBOUNCE_MS)) {
+                s_swLevel = LOW;
+                s_swPressStartMs = now;
+                s_pendingPress = true;
+                s_swLongFired = false;
+            }
+        }
     }
-    if (now - s_swLastEdgeMs < SW_DEBOUNCE_MS) return;   // reject bounce (press- and release-side)
-    s_swLastEdgeMs = now;
-    s_swLevel = LOW;
-    s_pendingPress    = true;
-    s_swPressStartMs  = now;
-    s_swLongFired     = false;
 }
 
 void knob::begin() {
@@ -212,6 +220,8 @@ void knob::begin() {
     attachInterrupt(digitalPinToInterrupt(PIN_KNOB_B), knob_isr, CHANGE);
 
     s_swLevel = (uint8_t)digitalRead(PIN_KNOB_SW);
+    s_swReleaseMs = (uint32_t)(esp_timer_get_time() / 1000);
+    s_swPressStartMs = 0;
     attachInterrupt(digitalPinToInterrupt(PIN_KNOB_SW), knob_sw_isr, CHANGE);
 
     Serial.println("[knob] ready on GPIO18(A)/17(B)/16(SW) — turn + push");
@@ -260,6 +270,14 @@ void knob::poll() {
         if (!orb_log_quiet())
             Serial.printf("[knob] turned %s  (pos=%ld)\n",
                           delta > 0 ? "RIGHT (CW)" : "LEFT (CCW)", (long)detent);
+    }
+
+    // Safety check: if physical pin has settled HIGH for > 50ms while s_swLevel is LOW,
+    // ensure s_swLevel is reconciled back to HIGH.
+    uint8_t pinVal = (uint8_t)digitalRead(PIN_KNOB_SW);
+    if (s_swLevel == LOW && pinVal == HIGH && (millis() - s_swPressStartMs >= 50)) {
+        s_swLevel = HIGH;
+        s_swReleaseMs = millis();
     }
 
     // --- Button: press is detected in the ISR (see knob_sw_isr); here we only

@@ -19,6 +19,7 @@ static uint32_t millis() {
 #include "custom_menu.h"     // CUSTOM_HAS_MENU — a Launch Kit push replaces this overlay's look
 #include "menu_sprite.h"     // menu_custom_plate()/menu_custom_overlay() — the editor's baked background / CRT+glass
 #include "menu_text.h"       // menu_text::refresh() — the editor's current/prev/next banners
+#include "knob.h"            // knob::takePress() to flush leftover commit clicks
 
 namespace {
     struct App {
@@ -50,6 +51,7 @@ namespace {
     // only thing eviction needs, and a counter cannot wrap into the past mid-session the
     // way a 32-bit millisecond count can.
     uint32_t s_useTick = 0;
+    uint32_t s_appEnterMs = 0;
 
     // app-switcher overlay (lives on the top layer, above whatever screen is loaded)
     bool      s_browsing      = false;
@@ -242,6 +244,7 @@ namespace {
         // Half a turn left over from browsing must not be waiting to move the menu the next
         // time it opens.
         s_browseAccum = 0;
+        knob::takePress();                 // flush the committing click or release bounce
         // The one place the switcher actually loads an app. load() handles the outgoing
         // onExit, the screen swap, capture state, and the incoming onEnter, so exactly
         // one app's artwork is decoded per selection rather than one per detent.
@@ -249,9 +252,16 @@ namespace {
         diag::log("enter %s", s_apps[s_cur].name);
     }
 
-    // Runs on the LVGL thread; if the switcher has sat idle long enough, drop into the shown app.
+    // Runs on the LVGL thread; if the switcher has sat idle long enough without a selection press,
+    // cancel browsing and return to the Clock (default home screen).
     void browse_tick(lv_timer_t * /*t*/) {
-        if (s_browsing && (millis() - s_browseTouch) >= BROWSE_SETTLE_MS) commit_current();
+        if (s_browsing && (millis() - s_browseTouch) >= BROWSE_SETTLE_MS) {
+            hide_overlay();
+            s_browseAccum = 0;
+            if (s_cur != app_shell::APP_CLOCK) {
+                load(app_shell::APP_CLOCK, false, true);
+            }
+        }
     }
 
     // Next non-hidden app from `from` stepping by `dir` (+1/-1), wrapping around.
@@ -353,6 +363,7 @@ namespace {
             }
         }
         if (s_apps[idx].onEnter) s_apps[idx].onEnter();
+        s_appEnterMs = millis();
         Serial.printf("[shell] app %d/%d: %s\n", s_cur + 1, s_count, s_apps[idx].name);
         diag::log("app %s", s_apps[idx].name);
     }
@@ -421,6 +432,10 @@ void app_shell::add_active(const char *name,
 
 bool app_shell::pressCurrent() {
     if (!s_count || !s_apps[s_cur].onPress) return false;
+    if (millis() - s_appEnterMs < 350) {
+        // App entered <350ms ago; swallow trailing press/bounce from switcher selection
+        return true;
+    }
     s_apps[s_cur].onPress();
     return true;
 }

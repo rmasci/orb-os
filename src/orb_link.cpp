@@ -20,6 +20,7 @@
 #include "theme_style.h"
 #include "theme_font.h"    // ?orb fonts: which typefaces actually loaded
 #include "update_ui.h"
+#include "popup_notice.h"
 #include "input_router.h"  // cmd_turn drives the real input path
 #include "app_shell.h"   // selectApp/nameAt for the app + apps commands
 #include <strings.h>     // strncasecmp
@@ -922,6 +923,35 @@ void cmd_put_done() {
     out_send();
 }
 
+void cmd_popup(const char *arg) {
+    if (!arg || !*arg) {
+        reply_error("missing message");
+        return;
+    }
+    const char *sep = strchr(arg, '|');
+    if (sep) {
+        char titleBuf[64];
+        size_t tLen = sep - arg;
+        if (tLen >= sizeof(titleBuf)) tLen = sizeof(titleBuf) - 1;
+        memcpy(titleBuf, arg, tLen);
+        titleBuf[tLen] = '\0';
+        const char *msg = sep + 1;
+        popup_notice::show(msg, titleBuf, 5000);
+    } else {
+        popup_notice::show(arg, "Notice", 5000);
+    }
+    out_reset();
+    out_str("{\"ok\":true}");
+    out_send();
+}
+
+void cmd_popup_dismiss() {
+    popup_notice::dismiss();
+    out_reset();
+    out_str("{\"ok\":true}");
+    out_send();
+}
+
 void dispatch(char *line) {
     // Split the verb from the rest. Only one argument is ever needed, so the remainder is
     // taken whole rather than tokenised further: a slug never contains a space, and if one
@@ -969,6 +999,8 @@ void dispatch(char *line) {
     else if (!strcmp(line, "handover"))  cmd_handover();
     else if (!strcmp(line, "sync"))      cmd_sync();
     else if (!strcmp(line, "sync-status")) cmd_sync_status();
+    else if (!strcmp(line, "popup"))     cmd_popup(arg);
+    else if (!strcmp(line, "popup-dismiss")) cmd_popup_dismiss();
     else                                 reply_error("unknown command");
 }
 
@@ -1030,7 +1062,13 @@ void poll() {
         // Untagged lines are somebody using the console, not talking to us. Silence is the
         // right response: echoing an error for every stray keystroke would bury the log.
         const size_t tag = strlen(REQ_TAG);
-        if (len > tag && !strncmp(s_line, REQ_TAG, tag)) dispatch(s_line + tag);
+        if (len > tag && !strncmp(s_line, REQ_TAG, tag)) {
+            dispatch(s_line + tag);
+        } else if (!strncmp(s_line, "popup ", 6)) {
+            cmd_popup(s_line + 6);
+        } else if (!strncmp(s_line, "msg ", 4)) {
+            cmd_popup(s_line + 4);
+        }
     }
 }
 

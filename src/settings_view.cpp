@@ -20,8 +20,13 @@
 #include "theme_font.h"   // per-theme fonts, with the compiled font as fallback        // per-theme wheel geometry/colors/highlight/default-selection — the runtime half of custom_settings.h's macros
 
 // Shared with main.cpp.
+extern void host_get_web_url(char *out, size_t n, char *alt, size_t alt_n);
+extern bool host_get_auth_info(char *userOut, size_t userLen);
+extern void host_disable_auth();
 extern int  host_get_brightness();
 extern void host_set_brightness(int v, bool save);
+extern int  host_get_rotation();
+extern void host_set_rotation(int deg, bool save);
 extern uint32_t host_get_idle_ms();
 extern void     host_set_idle_ms(uint32_t ms);
 extern void host_set_location(double lat, double lon);              // saves + reboots
@@ -73,18 +78,18 @@ extern void  host_set_range_km(float km);
 namespace {
     // MODE_LOCATION is a 4-item menu (current / search / recent / back); MODE_RECENT is
     // the scrollable list of recent cities you reach from that menu.
-    enum Mode { MODE_MENU, MODE_DISPLAY, MODE_BRIGHT, MODE_LOCATION, MODE_RECENT, MODE_SEARCH, MODE_SOUND, MODE_VOLUME, MODE_ABOUT,
+    enum Mode { MODE_MENU, MODE_DISPLAY, MODE_BRIGHT, MODE_TILT, MODE_LOCATION, MODE_RECENT, MODE_SEARCH, MODE_SOUND, MODE_VOLUME, MODE_ABOUT,
                 MODE_WIFI_LIST, MODE_WIFI_PASSWORD, MODE_WIFI_STATUS, MODE_RESET_CONFIRM, MODE_UNITS, MODE_CHIME_SELECT,
                 MODE_THEME_SELECT, MODE_THEME_NOTICE, MODE_DESIGN_SELECT, MODE_DESIGN_NOTICE, MODE_RANGE,
-                MODE_FIRSTBOOT, MODE_FIRSTBOOT_PHONE, MODE_NO_SDCARD };
+                MODE_FIRSTBOOT, MODE_FIRSTBOOT_PHONE, MODE_NO_SDCARD, MODE_WEB };
 
     // --- main settings menu ---
     // ITEM_RANGE was added when touch (and with it the on-screen zoom button) was
     // removed. Inserting mid-list shifts the numeric meaning of a theme's saved
     // "default selection", so an older theme may now open Settings on a neighbouring
     // item. Cosmetic only, and DEFAULT_SEL below still clamps anything out of range.
-    enum { ITEM_DISPLAY = 0, ITEM_LOCATION, ITEM_SOUND, ITEM_UNITS, ITEM_RANGE, ITEM_WIFI, ITEM_DESIGN, ITEM_ABOUT, ITEM_RESET, ITEM_BACK, ITEM_COUNT };
-    const char *ITEM_LABELS[ITEM_COUNT] = { "Display", "Location", "Sound", "Units", "Range", "WiFi", "Theme", "About", "Reset", "Back" };
+    enum { ITEM_DISPLAY = 0, ITEM_LOCATION, ITEM_SOUND, ITEM_UNITS, ITEM_RANGE, ITEM_WIFI, ITEM_DESIGN, ITEM_ABOUT, ITEM_RESET, ITEM_WEB, ITEM_BACK, ITEM_COUNT };
+    const char *ITEM_LABELS[ITEM_COUNT] = { "Display", "Location", "Sound", "Units", "Range", "WiFi", "Theme", "About", "Reset", "Web", "Back" };
     // A Launch Kit push's "Default selection" (was editor-preview-only; now baked
     // in) — which item the main menu opens on, both at first boot and every time
     // the app switcher hands control back to Settings. Out-of-range (a stale
@@ -102,6 +107,7 @@ namespace {
     enum { RNG_VALUE = 0, RNG_BACK, RNG_COUNT };
     const int RANGE_N = (int)(sizeof(RANGE_STEPS_KM) / sizeof(RANGE_STEPS_KM[0]));
 
+
     // --- display submenu (screen timeout + brightness) ---
     // No "Theme" row here any more. It picked between the two palettes compiled into the
     // firmware (Default, Office), which was the whole of theming before Orb Studio existed
@@ -109,7 +115,7 @@ namespace {
     // person whose themes come from Studio (Zion, 2026-09-14). The palettes themselves
     // stay compiled in as the fallback; only the control is gone. The main menu's Theme
     // entry, which switches between installed designs, is the real one.
-    enum { DSP_SCREEN = 0, DSP_BRIGHT, DSP_BACK, DSP_COUNT };
+    enum { DSP_SCREEN = 0, DSP_BRIGHT, DSP_TILT, DSP_BACK, DSP_COUNT };
     const uint32_t IDLE_MS[] = { 0, 28800000UL, 14400000UL, 7200000UL, 3600000UL, 1800000UL, 600000UL, 120000UL };
     const char *IDLE_LABELS[] = { "Always on", "8 hours", "4 hours", "2 hours", "1 hour", "30 min", "10 min", "2 min" };
     const int IDLE_N = (int)(sizeof(IDLE_MS) / sizeof(IDLE_MS[0]));
@@ -333,9 +339,12 @@ namespace {
     lv_obj_t *s_menu    = nullptr;
     lv_obj_t *s_hl      = nullptr;
     lv_obj_t *s_items[ITEM_COUNT] = { nullptr };
-    lv_obj_t *s_bright  = nullptr;
-    lv_obj_t *s_barFill = nullptr;
-    lv_obj_t *s_pct     = nullptr;
+    lv_obj_t *s_bright   = nullptr;
+    lv_obj_t *s_barFill  = nullptr;
+    lv_obj_t *s_pct      = nullptr;
+    lv_obj_t *s_tiltPage = nullptr;
+    lv_obj_t *s_tiltDeg  = nullptr;
+    int       s_tilt     = 0;
     lv_obj_t *s_lmPage  = nullptr;   // location menu
     lv_obj_t *s_lmHl    = nullptr;
     lv_obj_t *s_lmItems[LM_COUNT] = { nullptr };
@@ -376,6 +385,22 @@ namespace {
     lv_obj_t *s_plateImg = nullptr;    // themed background, built on enter / freed on exit
     lv_obj_t *s_ovImg    = nullptr;    // themed CRT+glass, same lifecycle
     lv_obj_t *s_aboutPage = nullptr;   // About: the boot splash, push to return
+    lv_obj_t *s_webPage            = nullptr;   // Web interface address display
+    lv_obj_t *s_webHl              = nullptr;
+    lv_obj_t *s_webBackItem        = nullptr;
+    lv_obj_t *s_webDisableAuthItem = nullptr;
+    lv_obj_t *s_webUrlLabel        = nullptr;
+    lv_obj_t *s_webAuthLabel       = nullptr;
+    int       s_webSel             = 0;
+
+    // --- Settings idle auto-return to Clock (3 min timeout) ---
+    static lv_timer_t *s_idleTimer = nullptr;
+    static uint32_t    s_lastActivityTick = 0;
+    static uint32_t    s_pageEnterTick = 0;
+    constexpr uint32_t SETTINGS_IDLE_TIMEOUT_MS = 180000;      // 3 minutes
+    constexpr uint32_t SETTINGS_IDLE_CHECK_INTERVAL_MS = 5000; // check every 5s
+
+    void settings_idle_tick(lv_timer_t * /*t*/);
     // The version, address and credit lines used to be three labels built here at hardcoded
     // offsets. They are theme data now (splash_style.json) and are drawn by splash_lines,
     // which the boot splash also uses, so the two places that show this picture cannot
@@ -477,6 +502,23 @@ namespace {
     lv_obj_t *s_wifiStatusPage= nullptr;
     lv_obj_t *s_wifiStatusLbl = nullptr;
     lv_obj_t *s_wifiStatusHint= nullptr;
+
+    void settings_idle_tick(lv_timer_t * /*t*/) {
+        if (!s_screen) return;
+        // No auto-return timer on initial setup
+        if (s_firstBootPrompt || s_pendingWifiSetup ||
+            s_mode == MODE_FIRSTBOOT || s_mode == MODE_FIRSTBOOT_PHONE || s_mode == MODE_NO_SDCARD) {
+            s_lastActivityTick = lv_tick_get();
+            return;
+        }
+        if (lv_tick_get() - s_lastActivityTick >= SETTINGS_IDLE_TIMEOUT_MS) {
+            diag::log("settings: 3m idle -> return to clock");
+            s_mode = MODE_MENU;
+            s_sel  = DEFAULT_SEL;
+            app_shell::setCaptured(false);
+            app_shell::selectApp(app_shell::APP_CLOCK);
+        }
+    }
 
     // Runtime-set from app_theme::palette() at init() — Office swaps every one of these
     // (see settingsview::init()) the same way ui.cpp's UI_* variables do.
@@ -692,8 +734,20 @@ namespace {
         snprintf(b, sizeof(b), "Screen   %s", IDLE_LABELS[idle_index()]);
         lv_label_set_text(s_dspItems[DSP_SCREEN], b);
         lv_label_set_text(s_dspItems[DSP_BRIGHT], "Brightness");
+        int rot = host_get_rotation();
+        int off = (rot > 180) ? (rot - 360) : rot;
+        if (off == 0) snprintf(b, sizeof(b), "Tilt   0°");
+        else snprintf(b, sizeof(b), "Tilt   %+d°", off);
+        lv_label_set_text(s_dspItems[DSP_TILT], b);
         lv_label_set_text(s_dspItems[DSP_BACK], "Back");
         wheel_layout(s_dspItems, DSP_COUNT, s_dspSel, s_dspHl);
+    }
+
+    void refresh_tilt() {
+        char buf[16];
+        if (s_tilt == 0) snprintf(buf, sizeof(buf), "0°");
+        else snprintf(buf, sizeof(buf), "%+d°", s_tilt);
+        lv_label_set_text(s_tiltDeg, buf);
     }
 
     void refresh_bright() {
@@ -945,7 +999,43 @@ namespace {
         splash_lines::setNetwork(s_netInfo);
     }
 
+    void refresh_web() {
+        if (!s_webUrlLabel || !s_webBackItem) return;
+        char primary[96] = {0};
+        host_get_web_url(primary, sizeof(primary), nullptr, 0);
+        lv_label_set_text(s_webUrlLabel, primary);
+
+        const Chrome &ch = chrome();
+        lv_obj_set_style_text_color(s_webUrlLabel, lv_color_hex(ch.selColor), 0);
+        lv_obj_set_style_text_opa(s_webUrlLabel, ch.themed ? (lv_opa_t)ch.selOpa : LV_OPA_COVER, 0);
+        lv_obj_align(s_webUrlLabel, LV_ALIGN_CENTER, 0, (lv_coord_t)lroundf(WHEEL_CY) - 52);
+
+        char authUser[32] = {0};
+        bool authOn = host_get_auth_info(authUser, sizeof(authUser));
+        if (s_webAuthLabel) {
+            char authTxt[64];
+            if (authOn) snprintf(authTxt, sizeof(authTxt), "Auth: Enabled (%s)", authUser);
+            else        snprintf(authTxt, sizeof(authTxt), "Auth: Disabled");
+            lv_label_set_text(s_webAuthLabel, authTxt);
+            lv_obj_set_style_text_color(s_webAuthLabel, C_DIM, 0);
+            lv_obj_align(s_webAuthLabel, LV_ALIGN_CENTER, 0, (lv_coord_t)lroundf(WHEEL_CY) - 85);
+        }
+
+        if (authOn && s_webDisableAuthItem) {
+            lv_label_set_text(s_webBackItem, "Back");
+            lv_label_set_text(s_webDisableAuthItem, "Disable Auth");
+            lv_obj_clear_flag(s_webDisableAuthItem, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_t *items[2] = { s_webBackItem, s_webDisableAuthItem };
+            wheel_layout(items, 2, s_webSel, s_webHl);
+        } else {
+            if (s_webDisableAuthItem) lv_obj_add_flag(s_webDisableAuthItem, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_webBackItem, "Back");
+            wheel_layout(&s_webBackItem, 1, 0, s_webHl);
+        }
+    }
+
     void show_page(Mode m) {
+        s_pageEnterTick = lv_tick_get();
         s_mode = m;
         // Before the refresh_*() calls below, which is where the drawing decisions happen.
         s_systemChrome = mode_is_system_chrome(m);
@@ -1000,6 +1090,7 @@ namespace {
         }
         lv_obj_add_flag(s_menu, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_bright, LV_OBJ_FLAG_HIDDEN);
+        if (s_tiltPage) lv_obj_add_flag(s_tiltPage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_lmPage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_recPage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_srchPage, LV_OBJ_FLAG_HIDDEN);
@@ -1009,6 +1100,7 @@ namespace {
         lv_obj_add_flag(s_rangePage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_volPage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_aboutPage, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_webPage, LV_OBJ_FLAG_HIDDEN);
         // Hiding the About page does not free its canvas, and that canvas is 651 KB of
         // PSRAM. Every other page here is a handful of labels; this one is not, so it is
         // the one page that has to give its memory back when it leaves the screen.
@@ -1028,6 +1120,7 @@ namespace {
         if (m == MODE_MENU)          { lv_obj_clear_flag(s_menu, LV_OBJ_FLAG_HIDDEN);    refresh_menu(); }
         else if (m == MODE_DISPLAY)  { lv_obj_clear_flag(s_dspPage, LV_OBJ_FLAG_HIDDEN); refresh_display(); }
         else if (m == MODE_BRIGHT)   { lv_obj_clear_flag(s_bright, LV_OBJ_FLAG_HIDDEN);  refresh_bright(); }
+        else if (m == MODE_TILT)     { lv_obj_clear_flag(s_tiltPage, LV_OBJ_FLAG_HIDDEN); refresh_tilt(); }
         else if (m == MODE_LOCATION) { lv_obj_clear_flag(s_lmPage, LV_OBJ_FLAG_HIDDEN);  refresh_locmenu(); }
         else if (m == MODE_RECENT)   { lv_obj_clear_flag(s_recPage, LV_OBJ_FLAG_HIDDEN); refresh_recent(); }
         else if (m == MODE_SOUND)    { lv_obj_clear_flag(s_sndPage, LV_OBJ_FLAG_HIDDEN); refresh_sound(); }
@@ -1036,6 +1129,7 @@ namespace {
         else if (m == MODE_RANGE)    { lv_obj_clear_flag(s_rangePage, LV_OBJ_FLAG_HIDDEN); refresh_range(); }
         else if (m == MODE_VOLUME)   { lv_obj_clear_flag(s_volPage, LV_OBJ_FLAG_HIDDEN); refresh_vol(); }
         else if (m == MODE_ABOUT)    { lv_obj_clear_flag(s_aboutPage, LV_OBJ_FLAG_HIDDEN); refresh_about(); }
+        else if (m == MODE_WEB)      { lv_obj_clear_flag(s_webPage, LV_OBJ_FLAG_HIDDEN); refresh_web(); }
         else if (m == MODE_RESET_CONFIRM) { lv_obj_clear_flag(s_resetPage, LV_OBJ_FLAG_HIDDEN); }
         else if (m == MODE_FIRSTBOOT)       { lv_obj_clear_flag(s_fbPage, LV_OBJ_FLAG_HIDDEN); refresh_firstboot(); }
         else if (m == MODE_FIRSTBOOT_PHONE) { lv_obj_clear_flag(s_fbPhonePage, LV_OBJ_FLAG_HIDDEN); }
@@ -1283,6 +1377,7 @@ namespace {
 // crash in that state. A guard can; a comment saying "call this only when built" cannot.
 void settingsview::onTurn(int delta) {
     if (!s_screen) return;   // not built; see the note above this function
+    s_lastActivityTick = lv_tick_get();
     const int step = (delta > 0) ? 1 : -1;
     if (s_mode == MODE_MENU) {
         s_sel = (s_sel + step < 0) ? 0 : (s_sel + step >= ITEM_COUNT ? ITEM_COUNT - 1 : s_sel + step);
@@ -1298,6 +1393,13 @@ void settingsview::onTurn(int delta) {
         if (s_bri > BRI_MAX) s_bri = BRI_MAX;
         host_set_brightness(s_bri, false);
         refresh_bright();
+    } else if (s_mode == MODE_TILT) {
+        s_tilt += delta;
+        while (s_tilt > 180) s_tilt -= 360;
+        while (s_tilt < -179) s_tilt += 360;
+        uint16_t rot = (uint16_t)((s_tilt % 360 + 360) % 360);
+        host_set_rotation(rot, false);
+        refresh_tilt();
     } else if (s_mode == MODE_FIRSTBOOT) {
         s_fbSel += step;
         if (s_fbSel < 0) s_fbSel = 0;
@@ -1382,6 +1484,16 @@ void settingsview::onTurn(int delta) {
         // ONE PAGE of it: you came here from the list and the list is where back means.
         s_sel = ITEM_ABOUT;      // land on the row you left from, not at the top
         show_page(MODE_MENU);
+    } else if (s_mode == MODE_WEB) {
+        char u[32] = {0};
+        bool authOn = host_get_auth_info(u, sizeof(u));
+        if (authOn) {
+            s_webSel = (s_webSel + step + 2) % 2;
+            refresh_web();
+        } else {
+            s_sel = ITEM_WEB;
+            show_page(MODE_MENU);
+        }
     } else if (s_mode == MODE_WIFI_STATUS || s_mode == MODE_THEME_NOTICE || s_mode == MODE_DESIGN_NOTICE) {
         // static pages — turning does nothing here
     } else if (s_mode == MODE_RESET_CONFIRM) {
@@ -1428,6 +1540,7 @@ namespace {
 // Called by app_shell when the shell switches away from Settings. Gives back the text
 // canvas and the background art so they are not held while another app needs the PSRAM.
 void settingsview::onExit() {
+    if (s_idleTimer) { lv_timer_del(s_idleTimer); s_idleTimer = nullptr; }
     if (!s_screen) return;   // not built; see the note above this function
     settings_text::release();
     settings_art_release();
@@ -1437,12 +1550,18 @@ void settingsview::onEnter() {
     if (!s_screen) return;   // not built; see the note above this function
     settings_art_acquire();
     settings_text::acquire();
+    s_lastActivityTick = lv_tick_get();
+    if (!s_idleTimer) {
+        s_idleTimer = lv_timer_create(settings_idle_tick, SETTINGS_IDLE_CHECK_INTERVAL_MS, nullptr);
+    }
     s_sel = DEFAULT_SEL;
     show_page(MODE_MENU);
 }
 
 void settingsview::onPress() {
     if (!s_screen) return;   // not built; see the note above this function
+    s_lastActivityTick = lv_tick_get();
+    if (lv_tick_get() - s_pageEnterTick < 300) return;
     if (s_mode == MODE_FIRSTBOOT) {
         if (s_fbSel == FB_ONDEVICE) {
             // Straight into the scan/pick/type flow that has existed in this file all
@@ -1477,9 +1596,10 @@ void settingsview::onPress() {
         else if (s_sel == ITEM_DESIGN) { s_designSel = 0; show_page(MODE_DESIGN_SELECT); }
         else if (s_sel == ITEM_ABOUT) { show_page(MODE_ABOUT); }
         else if (s_sel == ITEM_RESET) { show_page(MODE_RESET_CONFIRM); }
-        else {                                          // Back -> return to the app switcher
+        else if (s_sel == ITEM_WEB) { s_webSel = 0; show_page(MODE_WEB); }
+        else {                                          // Back -> return to Clock
             app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+            app_shell::selectApp(app_shell::APP_CLOCK);
         }
     } else if (s_mode == MODE_DISPLAY) {
         if (s_dspSel == DSP_SCREEN) {                   // cycle the screen-dim timeout
@@ -1488,24 +1608,40 @@ void settingsview::onPress() {
         } else if (s_dspSel == DSP_BRIGHT) {
             s_bri = host_get_brightness();
             show_page(MODE_BRIGHT);
-        } else {                                        // Back -> exit Settings to the app switcher
-            app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+        } else if (s_dspSel == DSP_TILT) {
+            int rot = host_get_rotation();
+            s_tilt = (rot > 180) ? (rot - 360) : rot;
+            show_page(MODE_TILT);
+        } else {                                        // Back -> return to Settings menu
+            s_sel = ITEM_DISPLAY;
+            show_page(MODE_MENU);
         }
     } else if (s_mode == MODE_BRIGHT) {
         host_set_brightness(s_bri, true);
-        app_shell::setCaptured(false);      // back always exits to the switcher, not one level up
-        app_shell::openSwitcher();
+        show_page(MODE_DISPLAY);
+    } else if (s_mode == MODE_TILT) {
+        uint16_t rot = (uint16_t)((s_tilt % 360 + 360) % 360);
+        host_set_rotation(rot, true);       // commit to NVS
+        show_page(MODE_DISPLAY);            // return to Display menu
     } else if (s_mode == MODE_ABOUT) {
-        app_shell::setCaptured(false);      // push anywhere on this page exits to the switcher
-        app_shell::openSwitcher();
+        s_sel = ITEM_ABOUT;
+        show_page(MODE_MENU);
+    } else if (s_mode == MODE_WEB) {
+        if (s_webSel == 1) {
+            host_disable_auth();
+            s_webSel = 0;
+            refresh_web();
+        } else {
+            s_sel = ITEM_WEB;
+            show_page(MODE_MENU);
+        }
     } else if (s_mode == MODE_RESET_CONFIRM) {
         host_factory_reset();          // wipes + shows its own countdown + reboots; doesn't return
     } else if (s_mode == MODE_WIFI_LIST) {
         if (s_wifiScanning) { /* wait for scan */ }
         else if (s_wifiSel < s_wifiCount) wifi_pick_network(s_wifiSel);
         else if (s_wifiSel == s_wifiCount) start_wifi_scan();          // Rescan
-        else { app_shell::setCaptured(false); app_shell::openSwitcher(); }   // Back
+        else { s_sel = ITEM_WIFI; show_page(MODE_MENU); }              // Back
     } else if (s_mode == MODE_WIFI_PASSWORD) {
         if (s_wkbIdx < N_WKEYS) {                                       // add a character
             const int L = (int)strlen(s_pass);
@@ -1542,9 +1678,9 @@ void settingsview::onPress() {
         if (s_unitsSel == UNIT_MODE) {
             host_wx_units_set((host_wx_units_mode() + 1) % 3);   // Auto -> Metric -> Imperial -> Auto
             refresh_units();
-        } else {                                        // Back -> exit Settings to the app switcher
-            app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+        } else {                                        // Back -> return to Settings menu
+            s_sel = ITEM_UNITS;
+            show_page(MODE_MENU);
         }
     } else if (s_mode == MODE_RANGE) {
         if (s_rangeSel == RNG_VALUE) {
@@ -1561,9 +1697,9 @@ void settingsview::onPress() {
             }
             host_set_range_km(RANGE_STEPS_KM[(best + 1) % RANGE_N]);
             refresh_range();
-        } else {                                        // Back -> exit Settings to the app switcher
-            app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+        } else {                                        // Back -> return to Settings menu
+            s_sel = ITEM_RANGE;
+            show_page(MODE_MENU);
         }
     } else if (s_mode == MODE_SOUND) {
         if (s_sndSel == SND_RADAR) {
@@ -1589,22 +1725,21 @@ void settingsview::onPress() {
         } else if (s_sndSel == SND_VOLUME) {
             s_volTarget = VOL_MASTER; s_vol = host_get_volume();
             show_page(MODE_VOLUME);
-        } else {                                        // Back -> exit Settings to the app switcher
-            app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+        } else {                                        // Back -> return to Settings menu
+            s_sel = ITEM_SOUND;
+            show_page(MODE_MENU);
         }
     } else if (s_mode == MODE_CHIME_SELECT) {
         if (s_chimeSel < host_chime_count()) host_chime_set(s_chimeSel);   // Back leaves it unchanged
-        app_shell::setCaptured(false);      // back always exits to the switcher, not one level up
-        app_shell::openSwitcher();
+        show_page(MODE_SOUND);
     } else if (s_mode == MODE_THEME_SELECT) {
         if (s_themeSel < APP_THEME_COUNT && s_themeSel != app_theme::get()) {
             show_page(MODE_THEME_NOTICE);
             lv_refr_now(NULL);           // force the notice onto the panel before the blocking reboot below
             app_theme::set(s_themeSel);  // reboots on device (never returns there); applies live + returns on the sim
         }
-        app_shell::setCaptured(false);   // back always exits to the switcher, not one level up
-        app_shell::openSwitcher();
+        s_sel = ITEM_DESIGN;
+        show_page(MODE_MENU);
     } else if (s_mode == MODE_THEME_NOTICE) {
         // transitional page — the device reboots before this could ever fire; only
         // reachable at all on the sim, and only if something presses during that instant
@@ -1614,8 +1749,8 @@ void settingsview::onPress() {
             lv_refr_now(NULL);                              // force the notice onto the panel before the blocking reboot below
             theme_select::set(s_designSlugs[s_designSel]);  // reboots on device (never returns there); re-execs on the sim
         }
-        app_shell::setCaptured(false);   // back always exits to the switcher, not one level up
-        app_shell::openSwitcher();
+        s_sel = ITEM_DESIGN;
+        show_page(MODE_MENU);
     } else if (s_mode == MODE_DESIGN_NOTICE) {
         // transitional page — the device reboots before this could ever fire; only
         // reachable at all on the sim, and only if something presses during that instant
@@ -1623,8 +1758,7 @@ void settingsview::onPress() {
         if (s_volTarget == VOL_TICK)       host_set_tick_volume(s_vol, true);
         else if (s_volTarget == VOL_CHIME) host_set_chime_volume(s_vol, true);
         else                             { host_set_volume(s_vol, true); host_sound_preview_beep(); }
-        app_shell::setCaptured(false);      // back always exits to the switcher, not one level up
-        app_shell::openSwitcher();
+        show_page(MODE_SOUND);
     } else if (s_mode == MODE_LOCATION) {
         if (s_lmSel == LM_CURRENT) {
             lv_label_set_text(s_lmItems[LM_CURRENT], "Locating...");
@@ -1637,16 +1771,15 @@ void settingsview::onPress() {
         } else if (s_lmSel == LM_RECENT) {
             load_recents();
             show_page(MODE_RECENT);
-        } else {                                        // Back -> exit Settings to the app switcher
-            app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+        } else {                                        // Back -> return to Settings menu
+            s_sel = ITEM_LOCATION;
+            show_page(MODE_MENU);
         }
     } else if (s_mode == MODE_RECENT) {
         if (s_recCount > 0 && s_recSel < s_recCount)
             host_set_location_named(s_recNames[s_recSel], s_recLat[s_recSel], s_recLon[s_recSel]);
-        else {                                              // Back (or empty list) -> app switcher
-            app_shell::setCaptured(false);
-            app_shell::openSwitcher();
+        else {                                          // Back (or empty list) -> Location menu
+            show_page(MODE_LOCATION);
         }
     } else {  // MODE_SEARCH
         const int L = (int)strlen(s_str);
@@ -1663,7 +1796,7 @@ void settingsview::onPress() {
         const char key = (s_kbIdx >= 0 && s_kbIdx < N_KEYS) ? KEYS[s_kbIdx] : '\0';
         if (key == '<') {                                   // backspace (empty -> exit search)
             if (L > 0) { s_str[L - 1] = 0; mark_dirty(); }
-            else { app_shell::setCaptured(false); app_shell::openSwitcher(); }   // exit to switcher
+            else { show_page(MODE_LOCATION); }          // exit to Location menu
         } else if (key == '_') {                            // space
             if (L > 0 && L < (int)sizeof(s_str) - 1) { s_str[L] = ' '; s_str[L + 1] = 0; }
             mark_dirty();
@@ -1750,6 +1883,53 @@ void settingsview::init() {
     lv_obj_set_style_text_font(bhint, &lv_font_montserrat_14, 0);
     lv_obj_align(bhint, LV_ALIGN_CENTER, 0, 110);
     reg_hint(bhint);
+
+    // --- tilt page ---
+    s_tiltPage = lv_obj_create(s_screen);
+    lv_obj_remove_style_all(s_tiltPage);
+    lv_obj_set_size(s_tiltPage, SCREEN_W, SCREEN_H); lv_obj_center(s_tiltPage);
+    lv_obj_clear_flag(s_tiltPage, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *tlabel = lv_label_create(s_tiltPage);
+    lv_label_set_text(tlabel, "Display Tilt");
+    lv_obj_set_style_text_color(tlabel, C_WHITE, 0);
+    lv_obj_set_style_text_font(tlabel, &lv_font_montserrat_20, 0);
+    lv_obj_align(tlabel, LV_ALIGN_CENTER, 0, -85);
+
+    // Horizon line to align against the desk
+    lv_obj_t *tbar = lv_obj_create(s_tiltPage);
+    lv_obj_remove_style_all(tbar);
+    lv_obj_set_size(tbar, 240, 2);
+    lv_obj_set_style_bg_color(tbar, C_ACCENT, 0);
+    lv_obj_set_style_bg_opa(tbar, LV_OPA_COVER, 0);
+    lv_obj_align(tbar, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *tcenter = lv_obj_create(s_tiltPage);
+    lv_obj_remove_style_all(tcenter);
+    lv_obj_set_size(tcenter, 2, 20);
+    lv_obj_set_style_bg_color(tcenter, C_ACCENT, 0);
+    lv_obj_set_style_bg_opa(tcenter, LV_OPA_COVER, 0);
+    lv_obj_align(tcenter, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *ttop = lv_obj_create(s_tiltPage);
+    lv_obj_remove_style_all(ttop);
+    lv_obj_set_size(ttop, 4, 18);
+    lv_obj_set_style_bg_color(ttop, C_ACCENT, 0);
+    lv_obj_set_style_bg_opa(ttop, LV_OPA_COVER, 0);
+    lv_obj_align(ttop, LV_ALIGN_TOP_MID, 0, 10);
+
+    s_tiltDeg = lv_label_create(s_tiltPage);
+    lv_label_set_text(s_tiltDeg, "0°");
+    lv_obj_set_style_text_color(s_tiltDeg, C_WHITE, 0);
+    lv_obj_set_style_text_font(s_tiltDeg, &lv_font_montserrat_28, 0);
+    lv_obj_align(s_tiltDeg, LV_ALIGN_CENTER, 0, -40);
+
+    lv_obj_t *thint = lv_label_create(s_tiltPage);
+    lv_label_set_text(thint, "turn to rotate, push to save");
+    lv_obj_set_style_text_color(thint, C_GREY, 0);
+    lv_obj_set_style_text_font(thint, &lv_font_montserrat_14, 0);
+    lv_obj_align(thint, LV_ALIGN_CENTER, 0, 110);
+    reg_hint(thint);
 
     // --- location menu page (Current / Search / Recent / Back) ---
     s_lmPage = lv_obj_create(s_screen);
@@ -2269,6 +2449,43 @@ void settingsview::init() {
         lv_obj_align(action, LV_ALIGN_CENTER, 0, 40);
     }
 
+    // --- Web interface info page ---
+    s_webPage = lv_obj_create(s_screen);
+    lv_obj_remove_style_all(s_webPage);
+    lv_obj_set_size(s_webPage, SCREEN_W, SCREEN_H); lv_obj_center(s_webPage);
+    lv_obj_clear_flag(s_webPage, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *webtitle = lv_label_create(s_webPage);
+    lv_label_set_text(webtitle, "Web");
+    lv_obj_set_style_text_color(webtitle, C_DIM, 0);
+    lv_obj_set_style_text_font(webtitle, &lv_font_montserrat_16, 0);
+    lv_obj_align(webtitle, LV_ALIGN_CENTER, 0, -122);
+    reg_hint(webtitle);
+
+    s_webHl = lv_obj_create(s_webPage);
+    style_highlight(s_webHl);
+
+    s_webBackItem = lv_label_create(s_webPage);
+    lv_label_set_text(s_webBackItem, "Back");
+
+    s_webUrlLabel = lv_label_create(s_webPage);
+    lv_obj_set_width(s_webUrlLabel, 400);
+    lv_label_set_long_mode(s_webUrlLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_webUrlLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_webUrlLabel, &lv_font_montserrat_16, 0);
+    lv_label_set_text(s_webUrlLabel, "");
+    lv_obj_align(s_webUrlLabel, LV_ALIGN_CENTER, 0, (lv_coord_t)lroundf(WHEEL_CY) - 52);
+
+    s_webDisableAuthItem = lv_label_create(s_webPage);
+    lv_label_set_text(s_webDisableAuthItem, "Disable Auth");
+    lv_obj_add_flag(s_webDisableAuthItem, LV_OBJ_FLAG_HIDDEN);
+
+    s_webAuthLabel = lv_label_create(s_webPage);
+    lv_obj_set_style_text_align(s_webAuthLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_webAuthLabel, &lv_font_montserrat_14, 0);
+    lv_label_set_text(s_webAuthLabel, "");
+    lv_obj_align(s_webAuthLabel, LV_ALIGN_CENTER, 0, (lv_coord_t)lroundf(WHEEL_CY) - 85);
+
     // --- WiFi: scrolling network list (same look as the main menu) ---
     s_wifiListPage = lv_obj_create(s_screen);
     lv_obj_remove_style_all(s_wifiListPage);
@@ -2439,6 +2656,7 @@ lv_obj_t *settingsview::build() {
 // Step 4 is generated from the declarations rather than typed, because it has to be
 // exhaustive: one missed pointer is a use-after-free on the next entry.
 void settingsview::destroy() {
+    if (s_idleTimer)   { lv_timer_del(s_idleTimer);   s_idleTimer   = nullptr; }
     if (s_searchTimer) { lv_timer_del(s_searchTimer); s_searchTimer = nullptr; }
     if (s_wifiTimer)   { lv_timer_del(s_wifiTimer);   s_wifiTimer   = nullptr; }
     settings_text::release();
@@ -2448,6 +2666,8 @@ void settingsview::destroy() {
     s_aboutPage = nullptr;
     s_barFill = nullptr;
     s_bright = nullptr;
+    s_tiltPage = nullptr;
+    s_tiltDeg = nullptr;
     s_chimeSelHl = nullptr;
     s_chimeSelPage = nullptr;
     s_designHl = nullptr;
@@ -2488,6 +2708,12 @@ void settingsview::destroy() {
     s_volPage = nullptr;
     s_volPct = nullptr;
     s_volTitle = nullptr;
+    s_webHl = nullptr;
+    s_webPage = nullptr;
+    s_webBackItem = nullptr;
+    s_webDisableAuthItem = nullptr;
+    s_webUrlLabel = nullptr;
+    s_webAuthLabel = nullptr;
     s_wifiHl = nullptr;
     s_wifiListHint = nullptr;
     s_wifiListPage = nullptr;

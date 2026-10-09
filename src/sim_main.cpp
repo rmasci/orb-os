@@ -66,6 +66,9 @@ static void sim_apply_home_location(const char *name, double lat, double lon);  
 int  host_get_brightness() { return 80; }
 void host_set_brightness(int, bool) {}
 void host_update_bright(bool) {}       // the device forces full brightness under an update notice
+static int s_simRotation = 0;
+int  host_get_rotation() { return s_simRotation; }
+void host_set_rotation(int deg, bool) { s_simRotation = (deg % 360 + 360) % 360; }
 uint32_t host_get_idle_ms() { return 0; }
 void host_set_idle_ms(uint32_t) {}
 void host_set_location(double lat, double lon) { sim_apply_home_location("", lat, lon); }
@@ -217,6 +220,15 @@ void host_factory_reset() {}
 bool host_wx_is_imperial() { return false; }
 int  host_wx_units_mode() { return 0; }
 void host_wx_units_set(int) {}
+void host_get_web_url(char *out, size_t n, char *alt, size_t alt_n) {
+    if (out) snprintf(out, n, "http://theorb.local");
+    if (alt) snprintf(alt, alt_n, "http://127.0.0.1:8080");
+}
+bool host_get_auth_info(char *userOut, size_t userLen) {
+    if (userOut && userLen > 0) snprintf(userOut, userLen, "admin");
+    return false;
+}
+void host_disable_auth() {}
 // Settings > Range. The real host persists to NVS and re-queries the feed; the sim just
 // holds the value and re-renders, which is enough to exercise the menu and the scope.
 static float s_simRangeKm = RANGE_KM_DEFAULT;

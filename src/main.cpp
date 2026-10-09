@@ -2,9 +2,11 @@
 // Order of work is in CLAUDE.md (milestones). Bring up the Waveshare demo first.
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <functional>
 #include <vector>
 #include <map>
 #include "config.h"
@@ -40,6 +42,7 @@
 #include "theme_audio.h"   // sounds a theme brings with it: wind.pcm, chime.pcm
 #include "chime_library.h" // every chime on the device, from flash and from every theme
 #include "display.h"                  // M0: CO5300 + LVGL bring-up
+#include "popup_notice.h"
 #include "lv_psram_alloc.h"           // [lvmem]: what the LVGL allocator holds, and where
 #include "imu_qmi8658.h"             // face-down sleep
 #include "battery.h"                 // AXP2101 battery gauge
@@ -85,6 +88,12 @@
 #include <esp_heap_caps.h>          // largest-free-block metric (heap health)
 #include <esp_wifi.h>               // WiFi driver control (reset must survive the reboot)
 #include <nvs.h>                    // erase the driver's "nvs.net80211" namespace (WiFi reset)
+#include <esp_mac.h>
+#include <nvs_flash.h>
+#include <esp_random.h>
+#include "mbedtls/aes.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/base64.h"
 
 // ---- shared state ----
 static std::vector<Aircraft> g_aircraft;      // latest snapshot: g_acTable, flattened, every poll
@@ -193,6 +202,233 @@ static String                g_tz = TZ_STR;                          // POSIX ti
 // a position MEANS rather than the position itself. Empty until something names it, which is
 // the honest state for a device handed bare coordinates. THEME_CAPS 54.
 static String                g_locName;
+static String                g_hostname;
+
+static String generate_default_hostname() {
+    static const char charset[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char buf[16];
+    for (int i = 0; i < 5; ++i) {
+        buf[i] = charset[esp_random() % (sizeof(charset) - 1)];
+    }
+    buf[5] = '_';
+    buf[6] = 'o';
+    buf[7] = 'r';
+    buf[8] = 'b';
+    buf[9] = '\0';
+    return String(buf);
+}
+
+static String sanitize_hostname(const String &in) {
+    String out = "";
+    for (size_t i = 0; i < in.length() && out.length() < 32; ++i) {
+        char c = in[i];
+        if (isalnum((unsigned char)c) || c == '_' || c == '-') {
+            out += c;
+        } else if (c == ' ') {
+            out += '_';
+        }
+    }
+    if (out.isEmpty()) return generate_default_hostname();
+    return out;
+}
+
+static void host_init_name() {
+    Preferences p;
+    p.begin("capsuleradar", false);
+    String stored = p.getString("hostname", "");
+    if (stored.isEmpty()) {
+        stored = generate_default_hostname();
+        p.putString("hostname", stored);
+        Serial.printf("[host] initialized default hostname: %s\n", stored.c_str());
+    } else {
+        Serial.printf("[host] loaded hostname: %s\n", stored.c_str());
+    }
+    p.end();
+    g_hostname = stored;
+}
+
+static const char *host_get_name() {
+    if (g_hostname.isEmpty()) host_init_name();
+    return g_hostname.c_str();
+}
+
+static char g_webUrlPrimary[96] = {0};
+static char g_webUrlSecondary[96] = {0};
+static bool g_webDnsResolved = false;
+static bool   g_authEnabled = false;
+static String g_authUser    = "admin";
+static String g_authPass    = "";
+
+static bool query_dns_ptr(IPAddress ip, IPAddress dns, char *out_name, size_t out_max) {
+    if (ip == IPAddress(0, 0, 0, 0) || dns == IPAddress(0, 0, 0, 0)) return false;
+
+    char qname[64];
+    snprintf(qname, sizeof(qname), "%u.%u.%u.%u.in-addr.arpa", ip[3], ip[2], ip[1], ip[0]);
+
+    uint8_t pkt[128];
+    memset(pkt, 0, sizeof(pkt));
+    uint16_t qid = (uint16_t)esp_random();
+    pkt[0] = (uint8_t)(qid >> 8);
+    pkt[1] = (uint8_t)(qid & 0xFF);
+    pkt[2] = 0x01; // Flags: RD = 1 (Recursion Desired)
+    pkt[3] = 0x00;
+    pkt[4] = 0x00; pkt[5] = 0x01; // QDCOUNT = 1
+
+    size_t idx = 12;
+    const char *p = qname;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len > 63) len = 63;
+        pkt[idx++] = (uint8_t)len;
+        memcpy(&pkt[idx], p, len);
+        idx += len;
+        if (!dot) break;
+        p = dot + 1;
+    }
+    pkt[idx++] = 0x00;
+    pkt[idx++] = 0x00; pkt[idx++] = 0x0C; // QTYPE = PTR (12)
+    pkt[idx++] = 0x00; pkt[idx++] = 0x01; // QCLASS = IN (1)
+    size_t pkt_len = idx;
+
+    WiFiUDP udp;
+    if (!udp.begin(0)) return false;
+    udp.beginPacket(dns, 53);
+    udp.write(pkt, pkt_len);
+    udp.endPacket();
+
+    uint32_t start = millis();
+    bool got_reply = false;
+    uint8_t resp[512];
+    int resp_len = 0;
+    while (millis() - start < 1500) {
+        int sz = udp.parsePacket();
+        if (sz > 0) {
+            resp_len = udp.read(resp, sizeof(resp));
+            got_reply = true;
+            break;
+        }
+        delay(20);
+    }
+    udp.stop();
+
+    if (!got_reply || resp_len < 12) return false;
+    if (resp[0] != pkt[0] || resp[1] != pkt[1]) return false;
+    uint16_t flags = ((uint16_t)resp[2] << 8) | resp[3];
+    if ((flags & 0x8000) == 0) return false;
+    if ((flags & 0x000F) != 0) return false;
+    uint16_t ancount = ((uint16_t)resp[6] << 8) | resp[7];
+    if (ancount == 0) return false;
+
+    auto read_name = [&](size_t &offset, char *out, size_t out_max_len) -> bool {
+        size_t cur = offset;
+        size_t out_idx = 0;
+        int jumps = 0;
+        bool offset_advanced = false;
+
+        while (cur < (size_t)resp_len) {
+            uint8_t len = resp[cur];
+            if (len == 0) {
+                if (!offset_advanced) offset = cur + 1;
+                break;
+            }
+            if ((len & 0xC0) == 0xC0) {
+                if (cur + 1 >= (size_t)resp_len) return false;
+                if (!offset_advanced) {
+                    offset = cur + 2;
+                    offset_advanced = true;
+                }
+                cur = (((size_t)(len & 0x3F)) << 8) | resp[cur + 1];
+                if (++jumps > 10) return false;
+                continue;
+            }
+            cur++;
+            if (cur + len > (size_t)resp_len) return false;
+            if (out_idx > 0 && out_idx < out_max_len - 1) out[out_idx++] = '.';
+            for (uint8_t i = 0; i < len && out_idx < out_max_len - 1; ++i) {
+                out[out_idx++] = resp[cur++];
+            }
+        }
+        out[out_idx] = '\0';
+        return out_idx > 0;
+    };
+
+    size_t cur = 12;
+    uint16_t qdcount = ((uint16_t)resp[4] << 8) | resp[5];
+    for (uint16_t q = 0; q < qdcount; ++q) {
+        char dummy[128];
+        if (!read_name(cur, dummy, sizeof(dummy))) return false;
+        cur += 4;
+    }
+
+    for (uint16_t a = 0; a < ancount && cur < (size_t)resp_len; ++a) {
+        char name[128];
+        if (!read_name(cur, name, sizeof(name))) return false;
+        if (cur + 10 > (size_t)resp_len) return false;
+        uint16_t atype = ((uint16_t)resp[cur] << 8) | resp[cur + 1];
+        uint16_t rdlen = ((uint16_t)resp[cur + 8] << 8) | resp[cur + 9];
+        cur += 10;
+        if (atype == 0x000C) { // PTR
+            size_t rdata_cur = cur;
+            char ptr_target[128] = {0};
+            if (read_name(rdata_cur, ptr_target, sizeof(ptr_target))) {
+                size_t plen = strlen(ptr_target);
+                if (plen > 0 && ptr_target[plen - 1] == '.') ptr_target[plen - 1] = '\0';
+                snprintf(out_name, out_max, "%s", ptr_target);
+                return true;
+            }
+        }
+        cur += rdlen;
+    }
+    return false;
+}
+
+static void resolve_web_dns() {
+    if (WiFi.status() != WL_CONNECTED) {
+        snprintf(g_webUrlPrimary, sizeof(g_webUrlPrimary), "Wi-Fi not connected");
+        g_webUrlSecondary[0] = '\0';
+        return;
+    }
+
+    char dns_name[96] = {0};
+    Serial.printf("[dns] resolving PTR for %s via %s...\n",
+                  WiFi.localIP().toString().c_str(), WiFi.dnsIP().toString().c_str());
+    bool ok = query_dns_ptr(WiFi.localIP(), WiFi.dnsIP(), dns_name, sizeof(dns_name));
+    if (ok && strlen(dns_name) > 0) {
+        Serial.printf("[dns] PTR answered: %s\n", dns_name);
+        snprintf(g_webUrlPrimary, sizeof(g_webUrlPrimary), "http://%s", dns_name);
+        snprintf(g_webUrlSecondary, sizeof(g_webUrlSecondary), "http://%s", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("[dns] PTR query had no answer; using IP address");
+        snprintf(g_webUrlPrimary, sizeof(g_webUrlPrimary), "http://%s", WiFi.localIP().toString().c_str());
+        snprintf(g_webUrlSecondary, sizeof(g_webUrlSecondary), "http://%s.local", host_get_name());
+    }
+    g_webDnsResolved = true;
+}
+
+void host_get_web_url(char *out, size_t n, char *alt, size_t alt_n) {
+    if (!g_webDnsResolved && WiFi.status() == WL_CONNECTED) {
+        resolve_web_dns();
+    }
+    if (out) snprintf(out, n, "%s", g_webUrlPrimary[0] ? g_webUrlPrimary : "Wi-Fi not connected");
+    if (alt) snprintf(alt, alt_n, "%s", g_webUrlSecondary);
+}
+
+bool host_get_auth_info(char *userOut, size_t userLen) {
+    if (userOut && userLen > 0) snprintf(userOut, userLen, "%s", g_authUser.c_str());
+    return g_authEnabled;
+}
+
+void host_disable_auth() {
+    g_authEnabled = false;
+    g_authPass = "";
+    Preferences p;
+    if (p.begin("capsuleradar", false)) {
+        p.putBool("authEn", false);
+        p.putString("authPass", "");
+        p.end();
+    }
+}
 static volatile bool         g_weatherDirty = false;
 static volatile bool         g_wxRadarDirty = false;
 static volatile bool         g_wxAnimDirty = false;      // new Weather app: frame set ready
@@ -312,7 +548,7 @@ static void adsb_task(void*) {
             Serial.printf("[adsb] WiFi up, IP %s\n", WiFi.localIP().toString().c_str());
             diag::log("wifi up %s", WiFi.localIP().toString().c_str());
             configTzTime(g_tz.c_str(), "pool.ntp.org", "time.nist.gov");  // local time (web-configurable TZ)
-            Serial.println("[web] config: http://" ORB_MDNS_ADDR "/  (or the IP above)");
+            Serial.printf("[web] config: http://%s.local/  (or the IP above)\n", host_get_name());
             nextWeatherAt = millis() + 5000UL; // let the first ADS-B poll complete before weather TLS
             nextWxRadarAt = millis() + 12000UL;
             // mDNS + OTA are started on core 1 (loop) to keep all mDNS use on one core
@@ -706,6 +942,9 @@ static void loadSettings() {
     // the scope can name the place without reverse-geocoding anything, which is the whole
     // reason the Orb needs no city database for this (Lerxtwood's request, 2026-09-25).
     g_locName          = p.getString("homeName", "");
+    g_authEnabled      = p.getBool("authEn", false);
+    g_authUser         = p.getString("authUser", "admin");
+    g_authPass         = p.getString("authPass", "");
     p.end();
     audio_set_chime(g_chimeIdx);   // no hardware dependency, safe before audio_begin()
     // fonts are baked into the widgets at creation time, so the large-text flag must be
@@ -1164,6 +1403,24 @@ void host_set_brightness(int v, bool save) {
     }
 }
 
+int host_get_rotation() { return g_rotation; }
+void host_set_rotation(int deg, bool save) {
+    deg = (deg % 360 + 360) % 360;
+    g_rotation = deg;
+    display::setRotation((uint16_t)g_rotation);
+    g_rotation = display::rotation();
+    if (save) {
+        Preferences p;
+        p.begin("capsuleradar", false);
+        p.putInt("rotDeg", g_rotation);
+        int offset = (g_rotation > 180) ? (g_rotation - 360) : g_rotation;
+        p.putInt("offset", offset);
+        p.end();
+        Serial.printf("[display] tilt saved: rotDeg=%d (offset=%+d)\n", g_rotation, offset);
+        diag::log("display tilt saved: %d deg (offset %+d)", g_rotation, offset);
+    }
+}
+
 // Screen-dim idle timeout (Settings > Display). 0 = always on / never dim.
 uint32_t host_get_idle_ms() { return g_idleDimMs; }
 void host_set_idle_ms(uint32_t ms) {
@@ -1527,49 +1784,187 @@ int host_wifi_scan_result(char names[][33], int8_t *rssi, bool *isOpen, int maxN
 // So this does not reason about the driver at all. capsuleradar is our namespace and nothing
 // in the WiFi stack touches it, so a copy kept there survives whatever begin() decides to do
 // to nvs.net80211. The password is written alongside the SSID; it already lives in plain
-// form in the driver's own namespace on the same flash, so this moves no secret anywhere it
-// was not already, and it is never logged.
-static void wifi_backup_credentials() {
-    wifi_config_t cur = {};
-    if (esp_wifi_get_config(WIFI_IF_STA, &cur) != ESP_OK) return;
-    if (cur.sta.ssid[0] == '\0') return;          // nothing stored yet, nothing to protect
-    Preferences p;
-    p.begin("capsuleradar", false);
-    p.putString("wifiBakSsid", (const char *)cur.sta.ssid);
-    p.putString("wifiBakPass", (const char *)cur.sta.password);
-    p.end();
-    Serial.printf("[wifi] stored network '%s' backed up before the attempt\n",
-                  (const char *)cur.sta.ssid);
+// ----------------------------- Encrypted Wi-Fi Credential Storage -----------------
+// Stored in the 'capsuleradar' NVS namespace as Base64 AES-256-CBC ciphertext.
+// The 256-bit AES key is derived at runtime from this specific chip's unique hardware
+// eFuse MAC address and firmware salt, so a physical flash dump from this device cannot
+// be decrypted on any other system or with any other board's key.
+// WiFi.persistent(false) keeps plaintext credentials completely OUT of nvs.net80211.
+namespace {
+    void get_device_credentials_key(uint8_t key[32]) {
+        uint8_t mac[6] = {0};
+        esp_efuse_mac_get_default(mac);
+        const char salt[] = "OrbOS_Hardware_WiFi_Secret_Salt_2026";
+        uint8_t buf[64];
+        memcpy(buf, mac, 6);
+        memcpy(buf + 6, salt, strlen(salt));
+        mbedtls_sha256(buf, 6 + strlen(salt), key, 0);
+    }
+
+    bool wifi_encrypt_password(const char *plain, String &out_b64) {
+        if (!plain) plain = "";
+        const size_t plain_len = strlen(plain);
+        const size_t pad_len = 16 - (plain_len % 16);
+        const size_t padded_len = plain_len + pad_len;
+        uint8_t *padded = (uint8_t *)malloc(padded_len);
+        if (!padded) return false;
+        memcpy(padded, plain, plain_len);
+        memset(padded + plain_len, (uint8_t)pad_len, pad_len);
+
+        uint8_t key[32];
+        get_device_credentials_key(key);
+
+        uint8_t iv[16];
+        esp_fill_random(iv, 16);
+        uint8_t iv_copy[16];
+        memcpy(iv_copy, iv, 16);
+
+        uint8_t *encrypted = (uint8_t *)malloc(padded_len);
+        if (!encrypted) { free(padded); return false; }
+
+        mbedtls_aes_context aes;
+        mbedtls_aes_init(&aes);
+        mbedtls_aes_setkey_enc(&aes, key, 256);
+        int ret = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv_copy, padded, encrypted);
+        mbedtls_aes_free(&aes);
+        free(padded);
+
+        if (ret != 0) { free(encrypted); return false; }
+
+        const size_t total_raw = 16 + padded_len;
+        uint8_t *raw = (uint8_t *)malloc(total_raw);
+        if (!raw) { free(encrypted); return false; }
+        memcpy(raw, iv, 16);
+        memcpy(raw + 16, encrypted, padded_len);
+        free(encrypted);
+
+        size_t b64_len = 0;
+        mbedtls_base64_encode(nullptr, 0, &b64_len, raw, total_raw);
+        char *b64 = (char *)malloc(b64_len + 1);
+        if (!b64) { free(raw); return false; }
+        mbedtls_base64_encode((unsigned char *)b64, b64_len + 1, &b64_len, raw, total_raw);
+        b64[b64_len] = '\0';
+        out_b64 = String(b64);
+        free(b64);
+        free(raw);
+        return true;
+    }
+
+    bool wifi_decrypt_password(const String &in_b64, char *out_plain, size_t max_len) {
+        if (in_b64.isEmpty()) {
+            if (out_plain && max_len > 0) out_plain[0] = '\0';
+            return true;
+        }
+        size_t raw_len = 0;
+        mbedtls_base64_decode(nullptr, 0, &raw_len, (const unsigned char *)in_b64.c_str(), in_b64.length());
+        if (raw_len < 32) return false;
+
+        uint8_t *raw = (uint8_t *)malloc(raw_len);
+        if (!raw) return false;
+        if (mbedtls_base64_decode(raw, raw_len, &raw_len, (const unsigned char *)in_b64.c_str(), in_b64.length()) != 0) {
+            free(raw);
+            return false;
+        }
+
+        uint8_t iv[16];
+        memcpy(iv, raw, 16);
+        const size_t cipher_len = raw_len - 16;
+        if (cipher_len % 16 != 0) { free(raw); return false; }
+
+        uint8_t *cipher = raw + 16;
+        uint8_t *decrypted = (uint8_t *)malloc(cipher_len);
+        if (!decrypted) { free(raw); return false; }
+
+        uint8_t key[32];
+        get_device_credentials_key(key);
+
+        mbedtls_aes_context aes;
+        mbedtls_aes_init(&aes);
+        mbedtls_aes_setkey_dec(&aes, key, 256);
+        int ret = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, cipher_len, iv, cipher, decrypted);
+        mbedtls_aes_free(&aes);
+        free(raw);
+
+        if (ret != 0) { free(decrypted); return false; }
+
+        const uint8_t pad_val = decrypted[cipher_len - 1];
+        if (pad_val == 0 || pad_val > 16 || pad_val > cipher_len) {
+            free(decrypted);
+            return false;
+        }
+        for (size_t i = 0; i < pad_val; ++i) {
+            if (decrypted[cipher_len - 1 - i] != pad_val) {
+                free(decrypted);
+                return false;
+            }
+        }
+        size_t plain_len = cipher_len - pad_val;
+        if (plain_len >= max_len) plain_len = max_len - 1;
+        memcpy(out_plain, decrypted, plain_len);
+        out_plain[plain_len] = '\0';
+        free(decrypted);
+        return true;
+    }
 }
 
-// Put it back. Called when an attempt fails or times out, so a wrong password on somebody
-// else's network can never cost the owner the network they had.
+static void wifi_backup_credentials() {
+    Preferences p;
+    p.begin("capsuleradar", false);
+    String ssid = p.getString("wifiSsid", "");
+    String encPass = p.getString("wifiEncPass", "");
+    if (ssid.isEmpty()) {
+        wifi_config_t cur = {};
+        if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK && cur.sta.ssid[0] != '\0') {
+            ssid = (const char *)cur.sta.ssid;
+            wifi_encrypt_password((const char *)cur.sta.password, encPass);
+        }
+    }
+    if (!ssid.isEmpty() && !encPass.isEmpty()) {
+        p.putString("wifiBakSsid", ssid);
+        p.putString("wifiBakEncPass", encPass);
+        Serial.printf("[wifi] encrypted network '%s' backed up before attempt\n", ssid.c_str());
+    }
+    p.remove("wifiBakPass"); // make sure no plaintext remains
+    p.end();
+}
+
 static void wifi_restore_credentials() {
     Preferences p;
     p.begin("capsuleradar", true);
     const String ssid = p.getString("wifiBakSsid", "");
-    const String pass = p.getString("wifiBakPass", "");
+    const String encPass = p.getString("wifiBakEncPass", "");
     p.end();
-    if (ssid.isEmpty()) return;
-    WiFi.persistent(true);
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    Serial.printf("[wifi] attempt failed; restored '%s'\n", ssid.c_str());
+    if (ssid.isEmpty() || encPass.isEmpty()) return;
+    char pass[65] = {0};
+    if (wifi_decrypt_password(encPass, pass, sizeof(pass))) {
+        WiFi.persistent(false);
+        WiFi.setHostname(host_get_name());
+        WiFi.begin(ssid.c_str(), pass);
+        memset(pass, 0, sizeof(pass));
+        Serial.printf("[wifi] attempt failed; restored '%s' from encrypted backup\n", ssid.c_str());
+    }
 }
 
 static void wifi_clear_backup() {
     Preferences p;
     p.begin("capsuleradar", false);
     p.remove("wifiBakSsid");
+    p.remove("wifiBakEncPass");
     p.remove("wifiBakPass");
     p.end();
 }
 
-// The stored network's NAME, for ?orb wifisaved. Never the password: the point of the
-// command is to let a failed attempt be tested without a reboot and without anybody having
-// to read a secret off a screen or a serial line.
 void host_wifi_saved_ssid(char *out, size_t n) {
-    wifi_config_t cur = {};
     out[0] = '\0';
+    Preferences p;
+    p.begin("capsuleradar", true);
+    String ssid = p.getString("wifiSsid", "");
+    p.end();
+    if (ssid.length() > 0) {
+        snprintf(out, n, "%s", ssid.c_str());
+        return;
+    }
+    wifi_config_t cur = {};
     if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK)
         snprintf(out, n, "%s", (const char *)cur.sta.ssid);
 }
@@ -1579,22 +1974,32 @@ void host_wifi_forget_backup() { wifi_clear_backup(); }
 
 void host_wifi_connect(const char *ssid, const char *pass) {
     if (g_wm.getConfigPortalActive()) g_wm.stopConfigPortal();   // hand off cleanly
-    wifi_backup_credentials();   // the actual protection; see above
-    WiFi.persistent(false);      // belt as well as braces, on the chance it does help
+    wifi_backup_credentials();
+    WiFi.persistent(false);
+    WiFi.setHostname(host_get_name());
     WiFi.begin(ssid, pass);
 }
 
-// Now it is true, so now it is written. Called only once the association has actually
-// succeeded, which is the fact the write was missing before.
-//
-// Re-begins with persistence on rather than reaching into the driver's NVS directly: the
-// device is already associated with this exact network, so this is cheap, and it is the one
-// path the Arduino core documents. The short wait afterwards is because a re-begin can drop
-// the link for a moment, and the caller's very next act is either an HTTP location lookup or
-// a reboot — neither of which wants to run through a reconnect.
 void host_wifi_commit_credentials(const char *ssid, const char *pass) {
-    wifi_clear_backup();     // it took, so there is nothing left to fall back to
-    WiFi.persistent(true);
+    wifi_clear_backup();
+    String encPass;
+    if (wifi_encrypt_password(pass ? pass : "", encPass)) {
+        Preferences p;
+        p.begin("capsuleradar", false);
+        p.putString("wifiSsid", ssid);
+        p.putString("wifiEncPass", encPass);
+        p.remove("wifiBakPass");
+        p.end();
+        Serial.printf("[wifi] credentials encrypted and saved for %s\n", ssid);
+    }
+    nvs_handle_t h;
+    if (nvs_open("nvs.net80211", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    WiFi.persistent(false);
+    WiFi.setHostname(host_get_name());
     WiFi.begin(ssid, pass);
     const uint32_t until = millis() + 3000;
     while (WiFi.status() != WL_CONNECTED && millis() < until) delay(50);
@@ -1715,6 +2120,10 @@ static const char ROOT_HEAD[] PROGMEM =
     "dl{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:0;font-size:15px}dt{color:#7a7570}dd{margin:0}"
     "a.b{display:block;padding:12px 14px;border:1px solid #e0e0df;border-radius:10px;color:#2a2622;text-decoration:none;margin-top:8px;font-weight:500}"
     "a.b:hover{border-color:#a65e3f;color:#a65e3f}small{color:#7a7570;display:block;margin-top:14px;line-height:1.5}"
+    ".btn{display:block;width:100%;padding:11px;border-radius:10px;border:1px solid #e0e0df;background:#2a2622;color:#fff;font-weight:600;font-size:14px;cursor:pointer;text-align:center;box-sizing:border-box}"
+    ".btn:hover{background:#a65e3f;border-color:#a65e3f}"
+    ".inp{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #e0e0df;border-radius:8px;font-size:14px;background:#fafaf9}"
+    "code{background:#eae9e8;padding:2px 5px;border-radius:4px;font-size:12px;word-break:break-all}"
     "</style></head><body>"
     "<h1>The Orb</h1><p class=sub>This Orb, over your WiFi</p>"
     "<div class=card><dl>";
@@ -1722,20 +2131,120 @@ static const char ROOT_HEAD[] PROGMEM =
 static const char ROOT_TAIL[] PROGMEM =
     "</dl></div>"
     "<div class=card>"
+    "<h2 style='font-size:16px;margin:0 0 10px'>Themes &amp; System</h2>"
     "<a class=b href='/install'>Install a theme file</a>"
-    // Upstream 2.16.64 guarded this link: with no OTA partition the page it points at
-    // 404s, so advertising it is a lie. Preserved here because this function moved into a
-    // PROGMEM literal in the same release — string-literal concatenation takes a #if
-    // perfectly well, so the guard survives the move intact.
 #if ORB_OTA_ENABLED
     "<a class=b href='/update'>Update the firmware over WiFi</a>"
 #endif
     "<a class=b href='/health'>Health readout</a>"
     "</div>"
-    "<small>Everything else is set on the Orb itself, with the knob, under Settings: location, "
-    "units, range, brightness, when the screen dims, sound, WiFi. What the screens look like is "
-    "designed in Orb Studio and installed from there over the cable, or as a file through the "
-    "link above.</small>"
+    "<div class=card>"
+    "<h2 style='font-size:16px;margin:0 0 10px'>Configuration Backup</h2>"
+    "<div id='cfgLockedMsg' style='display:none'>"
+    "<p style='font-size:13px;color:#7a7570;margin:0 0 6px'>Basic authentication must be enabled below to download or restore configuration.</p>"
+    "</div>"
+    "<div id='cfgControls'>"
+    "<a class=b href='/config.json' download='orb_config.json' style='text-align:center'>Download Config Backup (JSON)</a>"
+    "<div style='margin-top:14px'>"
+    "<label style='font-size:13px;color:#7a7570;display:block;margin-bottom:6px'>Restore Config from JSON file:</label>"
+    "<input type='file' id='cfgFile' accept='.json' style='width:100%;box-sizing:border-box;margin-bottom:8px'>"
+    "<button type='button' onclick='uploadConfig()' class='btn'>Upload &amp; Restore</button>"
+    "<div id='cfgMsg' style='margin-top:8px;font-size:13px;display:none'></div>"
+    "</div>"
+    "</div>"
+    "</div>"
+    "<div class=card>"
+    "<h2 style='font-size:16px;margin:0 0 10px'>Security &amp; Basic Auth</h2>"
+    "<p style='font-size:13px;color:#7a7570;margin:0 0 12px'>Require HTTP Basic Authentication for web access and API calls.</p>"
+    "<label style='display:flex;align-items:center;gap:8px;font-size:14px;margin-bottom:10px;cursor:pointer'>"
+    "<input type='checkbox' id='authEn' onchange='toggleAuthFields()'> Enable Basic Auth"
+    "</label>"
+    "<div id='authBox' style='display:none;margin-top:10px'>"
+    "<label style='font-size:12px;color:#7a7570;display:block;margin-bottom:4px'>Username</label>"
+    "<input type='text' id='authUser' class='inp' placeholder='admin' style='margin-bottom:8px'>"
+    "<label style='font-size:12px;color:#7a7570;display:block;margin-bottom:4px'>Password</label>"
+    "<input type='password' id='authPass' class='inp' placeholder='New password (or leave empty to keep)'>"
+    "</div>"
+    "<button type='button' onclick='saveAuth()' class='btn' style='margin-top:10px'>Save Security Settings</button>"
+    "<div id='authMsg' style='margin-top:8px;font-size:13px;display:none'></div>"
+    "</div>"
+    "<div class=card>"
+    "<h2 style='font-size:16px;margin:0 0 10px'>Send Popup Message</h2>"
+    "<p style='font-size:13px;color:#7a7570;margin:0 0 10px'>Display an instant 5-second notification on the Orb.</p>"
+    "<input type='text' id='popTitle' class='inp' placeholder='Title (default: Notice)' style='margin-bottom:8px'>"
+    "<input type='text' id='popMsg' class='inp' placeholder='Message text...' style='margin-bottom:8px'>"
+    "<button type='button' onclick='sendPopup()' class='btn'>Send to Orb</button>"
+    "<div id='popStatus' style='margin-top:8px;font-size:13px;display:none'></div>"
+    "</div>"
+    "<small>Everything else is set on the Orb itself, with the knob, under Settings. "
+    "You can also download or upload config using curl once basic auth is enabled:<br>"
+    "<code>curl -u user:pass http://orb.local/config.json -o config.json</code><br>"
+    "<code>curl -u user:pass -X POST --data-binary @config.json http://orb.local/config.json</code>"
+    "</small>"
+    "<script>"
+    "function toggleAuthFields(){document.getElementById('authBox').style.display=document.getElementById('authEn').checked?'block':'none';}"
+    "function updateConfigUI(en){"
+    "var l=document.getElementById('cfgLockedMsg'),c=document.getElementById('cfgControls');"
+    "if(l)l.style.display=en?'none':'block';"
+    "if(c)c.style.display=en?'block':'none';"
+    "}"
+    "function uploadConfig(){"
+    "var fi=document.getElementById('cfgFile'),msg=document.getElementById('cfgMsg');"
+    "if(!fi.files||!fi.files[0]){msg.style.display='block';msg.style.color='#c0392b';msg.innerText='Please select a JSON file first.';return;}"
+    "var reader=new FileReader();"
+    "reader.onload=function(e){"
+    "msg.style.display='block';msg.style.color='#7a7570';msg.innerText='Uploading...';"
+    "fetch('/config.json',{method:'POST',headers:{'Content-Type':'application/json'},body:e.target.result})"
+    ".then(function(r){return r.json();})"
+    ".then(function(res){"
+    "msg.style.color=res.ok?'#27ae60':'#c0392b';"
+    "msg.innerText=res.msg||(res.ok?'Config restored!':'Upload failed');"
+    "if(res.restart){msg.innerText+=' Device restarting...';setTimeout(function(){location.reload();},3500);}"
+    "}).catch(function(err){msg.style.color='#c0392b';msg.innerText='Error: '+err;});"
+    "};"
+    "reader.readAsText(fi.files[0]);"
+    "}"
+    "function saveAuth(){"
+    "var en=document.getElementById('authEn').checked,u=document.getElementById('authUser').value.trim(),p=document.getElementById('authPass').value;"
+    "var msg=document.getElementById('authMsg');"
+    "if(en&&!p&&!AUTH_CUR_SET){msg.style.display='block';msg.style.color='#c0392b';msg.innerText='Password cannot be empty.';return;}"
+    "msg.style.display='block';msg.style.color='#7a7570';msg.innerText='Saving...';"
+    "var fd=new URLSearchParams();fd.append('enable',en?'1':'0');fd.append('user',u||'admin');"
+    "if(p)fd.append('pass',p);"
+    "fetch('/auth',{method:'POST',body:fd})"
+    ".then(function(r){return r.json();})"
+    ".then(function(res){"
+    "msg.style.color=res.ok?'#27ae60':'#c0392b';"
+    "msg.innerText=res.ok?'Security settings saved!':(res.msg||'Save failed');"
+    "setTimeout(function(){location.reload();},1200);"
+    "}).catch(function(err){msg.style.color='#c0392b';msg.innerText='Error: '+err;});"
+    "}"
+    "function sendPopup(){"
+    "var m=document.getElementById('popMsg').value.trim();"
+    "var t=document.getElementById('popTitle').value.trim();"
+    "var st=document.getElementById('popStatus');"
+    "if(!m){st.style.display='block';st.style.color='#c0392b';st.innerText='Please enter a message.';return;}"
+    "st.style.display='block';st.style.color='#7a7570';st.innerText='Sending...';"
+    "var fd=new URLSearchParams();"
+    "fd.append('message',m);"
+    "if(t)fd.append('title',t);"
+    "fetch('/popup',{method:'POST',body:fd})"
+    ".then(function(r){return r.json();})"
+    ".then(function(res){"
+    "st.style.color=res.ok?'#27ae60':'#c0392b';"
+    "st.innerText=res.ok?'Message displayed on Orb!':(res.msg||'Failed');"
+    "if(res.ok){document.getElementById('popMsg').value='';}"
+    "}).catch(function(err){st.style.color='#c0392b';st.innerText='Error: '+err;});"
+    "}"
+    "window.onload=function(){"
+    "if(typeof AUTH_INIT!=='undefined'){"
+    "document.getElementById('authEn').checked=AUTH_INIT.en;"
+    "document.getElementById('authUser').value=AUTH_INIT.user||'admin';"
+    "toggleAuthFields();"
+    "updateConfigUI(AUTH_INIT.en);"
+    "}"
+    "};"
+    "</script>"
     "</body></html>";
 
 static void handleRoot() {
@@ -1744,13 +2253,22 @@ static void handleRoot() {
     g_web.setContentLength(CONTENT_LENGTH_UNKNOWN);
     g_web.send(200, "text/html", "");
     g_web.sendContent_P(ROOT_HEAD);
-    char row[200];
-    snprintf(row, sizeof(row), "<dt>Firmware</dt><dd>%s</dd><dt>Wearing</dt><dd>%s</dd><dt>Address</dt><dd>%s</dd>",
-             FW_VERSION, theme_style::themeLabel(), WiFi.localIP().toString().c_str());
+    char row[340];
+    snprintf(row, sizeof(row),
+             "<dt>Firmware</dt><dd>%s</dd><dt>Wearing</dt><dd>%s</dd><dt>Device Name</dt><dd>%s</dd><dt>Address</dt><dd>%s</dd><dt>Security</dt><dd>%s</dd>",
+             FW_VERSION, theme_style::themeLabel(), host_get_name(), WiFi.localIP().toString().c_str(),
+             g_authEnabled ? "Enabled" : "Disabled");
     // The (ptr, len) overloads throughout, never the String ones: sendContent(const char *)
     // converts through an Arduino String, which is an internal-heap allocation and exactly
     // what this page is being moved off.
     g_web.sendContent(row, strlen(row));
+
+    char initScript[160];
+    snprintf(initScript, sizeof(initScript),
+             "<script>const AUTH_INIT={en:%s,user:'%s'};const AUTH_CUR_SET=%s;</script>",
+             g_authEnabled ? "true" : "false", g_authUser.c_str(), g_authPass.length() > 0 ? "true" : "false");
+    g_web.sendContent(initScript, strlen(initScript));
+
     g_web.sendContent_P(ROOT_TAIL);
     g_web.sendContent("", 0);    // the zero-length chunk that ends a chunked body
 }
@@ -1901,7 +2419,8 @@ static void handleLegacyConfig() {
         "#map{height:220px;border-radius:10px;margin:6px 0 8px;border:1px solid #2a4a39;z-index:0}"
         "</style></head><body>"
         "<div class=hd><div class=dot></div><div><h1>The Orb OS</h1><p class=sub>Live ADS-B radar &middot; configuration</p></div></div>"
-        "<div class=card><div class=t>Location &amp; range</div><form method=POST action=/save>"
+        "<div class=card><div class=t>Device &amp; Location</div><form method=POST action=/save>"
+        "<label>Device name (hostname)</label><input id=hostname name=hostname value='%s' maxlength=32>"
         "<label>Center point &mdash; tap the map or drag the pin</label>"
         "<div id=map></div>"
         "<label>Center latitude</label><input id=lat name=lat value='%.5f'>"
@@ -1941,9 +2460,9 @@ static void handleLegacyConfig() {
         // The "Firmware update" link only exists when there is an OTA partition to write
         // into; otherwise it would advertise a page that 404s.
 #if ORB_OTA_ENABLED
-        "<p class=ft>Reach me at <code>" ORB_MDNS_ADDR "</code> &middot; <a href=/update style='color:#9affc8'>Firmware update</a> &middot; v" FW_VERSION "</p>"
+        "<p class=ft>Reach me at <code>%s.local</code> &middot; <a href=/update style='color:#9affc8'>Firmware update</a> &middot; v" FW_VERSION "</p>"
 #else
-        "<p class=ft>Reach me at <code>" ORB_MDNS_ADDR "</code> &middot; Update over USB &middot; v" FW_VERSION "</p>"
+        "<p class=ft>Reach me at <code>%s.local</code> &middot; Update over USB &middot; v" FW_VERSION "</p>"
 #endif
         "<script>"
         "var C=[%.5f,%.5f];var MAP=L.map('map').setView(C,10);"
@@ -1978,12 +2497,14 @@ static void handleLegacyConfig() {
         "for(i=0;i<e.options.length;i++){if(+e.options[i].dataset.off===o&&+e.options[i].dataset.dst===s){b=i;break;}}"
         "if(b<0)for(i=0;i<e.options.length;i++){if(+e.options[i].dataset.off===o){b=i;break;}}"
         "if(b>=0)e.selectedIndex=b;})();</script></body></html>",
+        host_get_name(),
         g_settings.homeLat, g_settings.homeLon, ropts.c_str(), topts.c_str(),
         tzopts.c_str(),
         g_brightnessDay, iopts.c_str(), g_showSweep ? "checked" : "",
         g_showAirports ? "checked" : "", g_hideGround ? "checked" : "", maopts.c_str(), g_milOnly ? "checked" : "",
         tlopts.c_str(), mxopts.c_str(), g_bigText ? "checked" : "", g_rotation, uopts.c_str(),
         g_volume, g_muted ? "checked" : "", aopts.c_str(), popts.c_str(),
+        host_get_name(),
         g_settings.homeLat, g_settings.homeLon, (g_tz == TZ_STR ? 0 : 1));
     g_web.send(200, "text/html", buf);
 }
@@ -2005,6 +2526,13 @@ static void handleSave() {
     Serial.printf("[web] save: %d argument(s)\n", g_web.args());
     for (int i = 0; i < g_web.args(); ++i)
         Serial.printf("[web]   %s = %s\n", g_web.argName(i).c_str(), g_web.arg(i).c_str());
+    if (g_web.hasArg("hostname")) {
+        const String nh = sanitize_hostname(g_web.arg("hostname"));
+        if (nh.length() > 0) {
+            const size_t n = p.putString("hostname", nh);
+            Serial.printf("[web] save: hostname=%s -> %u bytes\n", nh.c_str(), (unsigned)n);
+        }
+    }
     // Reject out-of-range coordinates so a typo can't leave the radar unusable.
     if (g_web.hasArg("lat")) {
         const double lat = g_web.arg("lat").toDouble();
@@ -2061,6 +2589,14 @@ static void handleWifi() {
         nvs_commit(h);
         nvs_close(h);
     }
+    Preferences p;
+    p.begin("capsuleradar", false);
+    p.remove("wifiSsid");
+    p.remove("wifiEncPass");
+    p.remove("wifiBakSsid");
+    p.remove("wifiBakEncPass");
+    p.remove("wifiBakPass");
+    p.end();
     delay(300);                     // let NVS finish committing before the reboot
     ESP.restart();
 }
@@ -2080,12 +2616,16 @@ static void handleBright() {
 }
 
 static void handleVol() {
-    if (g_web.hasArg("v"))    { g_volume = constrain((int)g_web.arg("v").toInt(), 0, 100); audio_set_volume(g_volume); }
-    if (g_web.hasArg("mute")) { g_muted = g_web.arg("mute").toInt() != 0; audio_set_muted(g_muted); }
+    if (g_web.hasArg("v"))     { g_volume = constrain((int)g_web.arg("v").toInt(), 0, 100); audio_set_volume(g_volume); }
+    if (g_web.hasArg("tick"))  { g_tickVol = constrain((int)g_web.arg("tick").toInt(), 0, 100); audio_set_tick_level(g_tickVol); }
+    if (g_web.hasArg("chime")) { g_chimeVol = constrain((int)g_web.arg("chime").toInt(), 0, 100); audio_set_chime_level(g_chimeVol); }
+    if (g_web.hasArg("mute"))  { g_muted = g_web.arg("mute").toInt() != 0; audio_set_muted(g_muted); }
     if (g_web.hasArg("save")) {
         Preferences p;
         p.begin("capsuleradar", false);
         p.putInt("vol", g_volume);
+        p.putInt("tickVol", g_tickVol);
+        p.putInt("chimeVol", g_chimeVol);
         p.putBool("mute", g_muted);
         p.end();
     }
@@ -2093,7 +2633,13 @@ static void handleVol() {
         if (g_web.arg("test").toInt() == 2) audio_selftest();   // long tone, ignores mute
         else audio_play(AUDIO_NEW);
     }
-    g_web.send(200, "text/plain", "ok");
+    String out = "{\"ok\":true,\"vol\":"; out += g_volume;
+    out += ",\"tick\":"; out += g_tickVol;
+    out += ",\"chime\":"; out += g_chimeVol;
+    out += ",\"muted\":"; out += g_muted ? "true" : "false";
+    out += ",\"present\":"; out += audio_present() ? "true" : "false";
+    out += "}\n";
+    g_web.send(200, "application/json", out);
 }
 
 static void handleAlerts() {   // what triggers the alert sound (live)
@@ -2261,10 +2807,328 @@ static void handleRotate() {   // arbitrary clockwise display rotation, applied 
             Preferences p;
             p.begin("capsuleradar", false);
             p.putInt("rotDeg", g_rotation);
+            int offset = (g_rotation > 180) ? (g_rotation - 360) : g_rotation;
+            p.putInt("offset", offset);
             p.end();
         }
     }
     g_web.send(200, "text/plain", "ok");
+}
+
+static bool checkAuth() {
+    if (!g_authEnabled) return true;
+    if (g_web.authenticate(g_authUser.c_str(), g_authPass.c_str())) return true;
+    g_web.requestAuthentication(BASIC_AUTH, "The Orb", "Authentication required");
+    return false;
+}
+
+template<typename F>
+static std::function<void(void)> withAuth(F fn) {
+    return [fn]() {
+        if (!checkAuth()) return;
+        fn();
+    };
+}
+
+static void handleConfigExport() {
+    if (!g_authEnabled) {
+        g_web.send(403, "application/json", "{\"ok\":false,\"msg\":\"Basic auth must be enabled to download configuration\"}");
+        return;
+    }
+    if (!checkAuth()) return;
+    JsonDocument doc;
+    doc["hostname"] = host_get_name();
+    doc["homeLat"] = g_settings.homeLat;
+    doc["homeLon"] = g_settings.homeLon;
+    doc["homeName"] = g_locName;
+    doc["rangeKm"] = g_settings.rangeKm;
+    doc["units"] = g_units;
+    doc["wxUnits"] = g_wxUnits;
+    doc["tz"] = g_tz;
+    doc["bright"] = g_brightnessDay;
+    doc["vol"] = g_volume;
+    doc["tickVol"] = g_tickVol;
+    doc["chimeVol"] = g_chimeVol;
+    doc["mute"] = g_muted;
+    doc["sndRadar"] = g_soundRadar;
+    doc["sndChime"] = g_soundChime;
+    doc["chimeIdx"] = g_chimeIdx;
+    doc["alertmode"] = g_alertMode;
+    doc["proxkm"] = g_proximityKm;
+    doc["traillen"] = g_trailLen;
+    doc["maxac"] = g_maxAc;
+    doc["idledim"] = g_idleDimMs;
+    doc["rotDeg"] = g_rotation;
+    int offset = (g_rotation > 180) ? (g_rotation - 360) : g_rotation;
+    doc["offset"] = offset;
+    doc["bigtext"] = g_bigText;
+    doc["hideground"] = g_hideGround;
+    doc["milonly"] = g_milOnly;
+    doc["theme"] = radar::theme();
+
+    String out;
+    serializeJsonPretty(doc, out);
+    g_web.sendHeader("Content-Disposition", "attachment; filename=\"orb_config.json\"");
+    g_web.send(200, "application/json", out);
+}
+
+static void handleConfigImport() {
+    if (!g_authEnabled) {
+        g_web.send(403, "application/json", "{\"ok\":false,\"msg\":\"Basic auth must be enabled to upload configuration\"}");
+        return;
+    }
+    if (!checkAuth()) return;
+    if (g_web.method() != HTTP_POST) {
+        g_web.send(405, "application/json", "{\"ok\":false,\"msg\":\"POST required\"}");
+        return;
+    }
+    String body = g_web.arg("plain");
+    if (body.isEmpty()) {
+        g_web.send(400, "application/json", "{\"ok\":false,\"msg\":\"Empty request body\"}");
+        return;
+    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        char errBuf[128];
+        snprintf(errBuf, sizeof(errBuf), "{\"ok\":false,\"msg\":\"JSON error: %s\"}", err.c_str());
+        g_web.send(400, "application/json", errBuf);
+        return;
+    }
+
+    Preferences p;
+    if (!p.begin("capsuleradar", false)) {
+        g_web.send(500, "application/json", "{\"ok\":false,\"msg\":\"NVS unavailable\"}");
+        return;
+    }
+
+    bool needRestart = false;
+
+    if (doc["hostname"].is<const char*>()) {
+        String nh = sanitize_hostname(doc["hostname"].as<const char*>());
+        if (nh.length() > 0 && nh != g_hostname) {
+            g_hostname = nh;
+            p.putString("hostname", nh);
+            needRestart = true;
+        }
+    }
+    if (doc["homeLat"].is<double>() && doc["homeLon"].is<double>()) {
+        g_settings.homeLat = doc["homeLat"].as<double>();
+        g_settings.homeLon = doc["homeLon"].as<double>();
+        g_locationSet = true;
+        p.putDouble("homeLat", g_settings.homeLat);
+        p.putDouble("homeLon", g_settings.homeLon);
+        p.putBool("locSet", true);
+        if (doc["homeName"].is<const char*>()) {
+            g_locName = doc["homeName"].as<String>();
+            p.putString("homeName", g_locName);
+        }
+        g_adsb.setHome(g_settings.homeLat, g_settings.homeLon);
+    }
+    if (doc["rangeKm"].is<float>()) {
+        g_settings.rangeKm = doc["rangeKm"].as<float>();
+        p.putFloat("rangeKm", g_settings.rangeKm);
+    }
+    if (doc["units"].is<int>()) {
+        g_units = constrain(doc["units"].as<int>(), 0, 2);
+        p.putInt("units", g_units);
+    }
+    if (doc["wxUnits"].is<int>()) {
+        g_wxUnits = constrain(doc["wxUnits"].as<int>(), 0, 2);
+        p.putInt("wxUnits", g_wxUnits);
+    }
+    if (doc["tz"].is<const char*>()) {
+        g_tz = doc["tz"].as<String>();
+        p.putString("tz", g_tz);
+        setenv("TZ", g_tz.c_str(), 1);
+        tzset();
+    }
+    if (doc["bright"].is<int>()) {
+        g_brightnessDay = constrain(doc["bright"].as<int>(), 0, 255);
+        p.putInt("bright", g_brightnessDay);
+        display::setBrightness((uint8_t)g_brightnessDay);
+    }
+    if (doc["vol"].is<int>()) {
+        g_volume = constrain(doc["vol"].as<int>(), 0, 100);
+        p.putInt("vol", g_volume);
+        audio_set_volume(g_volume);
+    }
+    if (doc["tickVol"].is<int>()) {
+        g_tickVol = constrain(doc["tickVol"].as<int>(), 0, 100);
+        p.putInt("tickVol", g_tickVol);
+        audio_set_tick_level(g_tickVol);
+    }
+    if (doc["chimeVol"].is<int>()) {
+        g_chimeVol = constrain(doc["chimeVol"].as<int>(), 0, 100);
+        p.putInt("chimeVol", g_chimeVol);
+        audio_set_chime_level(g_chimeVol);
+    }
+    if (doc["mute"].is<bool>()) {
+        g_muted = doc["mute"].as<bool>();
+        p.putBool("mute", g_muted);
+        audio_set_muted(g_muted);
+    }
+    if (doc["sndRadar"].is<bool>()) {
+        g_soundRadar = doc["sndRadar"].as<bool>();
+        p.putBool("sndRadar", g_soundRadar);
+    }
+    if (doc["sndChime"].is<bool>()) {
+        g_soundChime = doc["sndChime"].as<bool>();
+        p.putBool("sndChime", g_soundChime);
+    }
+    if (doc["chimeIdx"].is<int>()) {
+        g_chimeIdx = constrain(doc["chimeIdx"].as<int>(), 0, audio_chime_count() - 1);
+        p.putInt("chimeIdx", g_chimeIdx);
+        audio_set_chime(g_chimeIdx);
+    }
+    if (doc["alertmode"].is<int>()) {
+        g_alertMode = constrain(doc["alertmode"].as<int>(), 0, 2);
+        p.putInt("alertmode", g_alertMode);
+    }
+    if (doc["proxkm"].is<float>()) {
+        g_proximityKm = doc["proxkm"].as<float>();
+        p.putFloat("proxkm", g_proximityKm);
+    }
+    if (doc["traillen"].is<int>()) {
+        g_trailLen = constrain(doc["traillen"].as<int>(), 1, 10);
+        p.putInt("traillen", g_trailLen);
+    }
+    if (doc["maxac"].is<int>()) {
+        g_maxAc = constrain(doc["maxac"].as<int>(), 1, ADSB_MAX_AIRCRAFT);
+        p.putInt("maxac", g_maxAc);
+        radar::setMaxOnScreen(g_maxAc);
+    }
+    if (doc["idledim"].is<uint32_t>()) {
+        g_idleDimMs = doc["idledim"].as<uint32_t>();
+        p.putUInt("idledim", g_idleDimMs);
+    }
+    if (doc["rotDeg"].is<int>()) {
+        g_rotation = constrain(doc["rotDeg"].as<int>(), 0, 359);
+        display::setRotation((uint16_t)g_rotation);
+        g_rotation = display::rotation();
+        p.putInt("rotDeg", g_rotation);
+        int offset = (g_rotation > 180) ? (g_rotation - 360) : g_rotation;
+        p.putInt("offset", offset);
+    } else if (doc["offset"].is<int>()) {
+        int off = doc["offset"].as<int>();
+        int rot = (off % 360 + 360) % 360;
+        g_rotation = rot;
+        display::setRotation((uint16_t)g_rotation);
+        g_rotation = display::rotation();
+        p.putInt("rotDeg", g_rotation);
+        p.putInt("offset", off);
+    }
+    if (doc["bigtext"].is<bool>()) {
+        bool bt = doc["bigtext"].as<bool>();
+        if (bt != g_bigText) {
+            g_bigText = bt;
+            p.putBool("bigtext", g_bigText);
+            needRestart = true;
+        }
+    }
+    if (doc["hideground"].is<bool>()) {
+        g_hideGround = doc["hideground"].as<bool>();
+        p.putBool("hideground", g_hideGround);
+        g_adsb.setHideGround(g_hideGround);
+    }
+    if (doc["milonly"].is<bool>()) {
+        g_milOnly = doc["milonly"].as<bool>();
+        p.putBool("milonly", g_milOnly);
+        g_adsb.setMilitaryOnly(g_milOnly);
+    }
+    if (doc["theme"].is<int>()) {
+        int th = constrain(doc["theme"].as<int>(), 0, THEME_COUNT - 1);
+        p.putInt("theme", th);
+        radar::setTheme(th);
+    }
+    p.end();
+
+    char resp[160];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"msg\":\"Configuration applied successfully\",\"restart\":%s}", needRestart ? "true" : "false");
+    g_web.send(200, "application/json", resp);
+
+    if (needRestart) {
+        delay(800);
+        ESP.restart();
+    }
+}
+
+static void handleAuth() {
+    if (!checkAuth()) return;
+    if (g_web.method() != HTTP_POST) {
+        g_web.send(405, "application/json", "{\"ok\":false,\"msg\":\"POST required\"}");
+        return;
+    }
+    Preferences p;
+    if (!p.begin("capsuleradar", false)) {
+        g_web.send(500, "application/json", "{\"ok\":false,\"msg\":\"NVS unavailable\"}");
+        return;
+    }
+    bool en = g_web.hasArg("enable") ? (g_web.arg("enable").toInt() != 0) : g_authEnabled;
+    if (g_web.hasArg("user")) {
+        String u = g_web.arg("user");
+        u.trim();
+        if (u.length() > 0) g_authUser = u;
+    }
+    if (g_web.hasArg("pass")) {
+        String pwd = g_web.arg("pass");
+        pwd.trim();
+        if (pwd.length() > 0) g_authPass = pwd;
+    }
+    if (en && g_authPass.length() == 0) {
+        p.end();
+        g_web.send(400, "application/json", "{\"ok\":false,\"msg\":\"Password cannot be empty when enabling auth\"}");
+        return;
+    }
+    g_authEnabled = en;
+    p.putBool("authEn", g_authEnabled);
+    p.putString("authUser", g_authUser);
+    p.putString("authPass", g_authPass);
+    p.end();
+
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"enabled\":%s,\"user\":\"%s\"}",
+             g_authEnabled ? "true" : "false", g_authUser.c_str());
+    g_web.send(200, "application/json", resp);
+}
+
+static void handlePopup() {
+    String msg = "";
+    String title = "Notice";
+
+    if (g_web.hasArg("plain")) {
+        String body = g_web.arg("plain");
+        if (!body.isEmpty() && body.startsWith("{")) {
+            JsonDocument doc;
+            if (!deserializeJson(doc, body)) {
+                if (doc["message"].is<const char*>()) msg = doc["message"].as<String>();
+                else if (doc["text"].is<const char*>()) msg = doc["text"].as<String>();
+                else if (doc["msg"].is<const char*>()) msg = doc["msg"].as<String>();
+                if (doc["title"].is<const char*>()) title = doc["title"].as<String>();
+            }
+        }
+    }
+    if (msg.isEmpty()) {
+        if (g_web.hasArg("message")) msg = g_web.arg("message");
+        else if (g_web.hasArg("text")) msg = g_web.arg("text");
+        else if (g_web.hasArg("msg")) msg = g_web.arg("msg");
+    }
+    if (g_web.hasArg("title")) {
+        title = g_web.arg("title");
+    }
+    msg.trim();
+    if (msg.isEmpty()) {
+        g_web.send(400, "application/json", "{\"ok\":false,\"msg\":\"Missing message\"}");
+        return;
+    }
+
+    popup_notice::show(msg.c_str(), title.c_str(), 5000);
+    g_web.send(200, "application/json", "{\"ok\":true,\"msg\":\"Popup displayed\"}");
+}
+
+static void handlePopupDismiss() {
+    popup_notice::dismiss();
+    g_web.send(200, "application/json", "{\"ok\":true,\"msg\":\"Dismissed\"}");
 }
 
 #if ORB_OTA_ENABLED
@@ -2769,6 +3633,7 @@ void setup() {
     // and every view built below gets the theme's typography on its first label.
     theme_font::begin();
     build_hold_warning();   // hold-to-reboot countdown, sits above every app
+    host_init_name();
 
     // restore the saved theme, then persist any future change
     {
@@ -2798,7 +3663,14 @@ void setup() {
         g_milOnly = p.getBool("milonly", false);
         // Migrate the old quarter-turn setting (rot=0..3) without changing existing
         // installations' orientation. New firmware stores actual degrees separately.
-        g_rotation = p.isKey("rotDeg") ? p.getInt("rotDeg", 0) : p.getInt("rot", 0) * 90;
+        if (p.isKey("offset")) {
+            int off = p.getInt("offset", 0);
+            g_rotation = (off % 360 + 360) % 360;
+        } else if (p.isKey("rotDeg")) {
+            g_rotation = p.getInt("rotDeg", 0);
+        } else {
+            g_rotation = p.getInt("rot", 0) * 90;
+        }
         g_rotation = constrain(g_rotation, 0, 359);
         p.end();
         if (!migratedV2) {
@@ -2997,6 +3869,7 @@ void setup() {
     // so the radar keeps animating while you configure WiFi from your phone.
     g_wm.setConfigPortalBlocking(false);
     g_wm.setTitle("The Orb OS");
+    g_wm.setHostname(host_get_name());
     // light phosphor-green theme for the captive portal (small CSS, injected into <head>)
     g_wm.setCustomHeadElement(
         "<style>"
@@ -3013,6 +3886,24 @@ void setup() {
     // interface in non-blocking mode, so the config page is flaky until a fresh boot.
     g_wm.setSaveConfigCallback([]() {
         Serial.println("[wifi] new credentials saved -> rebooting for a clean web/mDNS start");
+        wifi_config_t cur = {};
+        if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK && cur.sta.ssid[0] != '\0') {
+            String enc;
+            if (wifi_encrypt_password((const char *)cur.sta.password, enc)) {
+                Preferences p;
+                p.begin("capsuleradar", false);
+                p.putString("wifiSsid", (const char *)cur.sta.ssid);
+                p.putString("wifiEncPass", enc);
+                p.remove("wifiBakPass");
+                p.end();
+            }
+            nvs_handle_t h;
+            if (nvs_open("nvs.net80211", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_erase_all(h);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+        }
         g_rebootAtMs = millis() + 2500;   // let the portal deliver its 'saved' page first
     });
     // DISABLED on purpose (2026-08-15). A secrets.h fallback used to run here and it was
@@ -3042,13 +3933,57 @@ void setup() {
     // happened to hold: CanadianAvenger's 2.16.17 report, "WiFi not remembered" on one
     // power cycle and remembered on the next.
     WiFi.mode(WIFI_STA);
+    WiFi.setHostname(host_get_name());
     char storedSsid[33] = {0};
-    {
+    char storedPass[65] = {0};
+    bool haveStoredNetwork = false;
+
+    // Check encrypted credentials in capsuleradar namespace
+    Preferences pWifi;
+    pWifi.begin("capsuleradar", true);
+    String encSsid = pWifi.getString("wifiSsid", "");
+    String encPass = pWifi.getString("wifiEncPass", "");
+    pWifi.end();
+
+    if (!encSsid.isEmpty() && !encPass.isEmpty()) {
+        snprintf(storedSsid, sizeof(storedSsid), "%s", encSsid.c_str());
+        if (wifi_decrypt_password(encPass, storedPass, sizeof(storedPass))) {
+            haveStoredNetwork = true;
+            Serial.printf("[wifi] loaded encrypted credentials for '%s'\n", storedSsid);
+        }
+    } else {
+        // Migration: check if legacy credentials exist in driver NVS
         wifi_config_t cur = {};
-        if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK)
+        if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK && cur.sta.ssid[0] != '\0') {
             snprintf(storedSsid, sizeof(storedSsid), "%s", (const char *)cur.sta.ssid);
+            snprintf(storedPass, sizeof(storedPass), "%s", (const char *)cur.sta.password);
+            haveStoredNetwork = true;
+            Serial.printf("[wifi] migrating legacy credentials for '%s' to encrypted storage\n", storedSsid);
+            String newEnc;
+            if (wifi_encrypt_password(storedPass, newEnc)) {
+                Preferences pMig;
+                pMig.begin("capsuleradar", false);
+                pMig.putString("wifiSsid", storedSsid);
+                pMig.putString("wifiEncPass", newEnc);
+                pMig.remove("wifiBakPass");
+                pMig.end();
+            }
+            // Wipe driver NVS so plaintext is permanently purged from flash
+            nvs_handle_t h;
+            if (nvs_open("nvs.net80211", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_erase_all(h);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+        }
     }
-    const bool haveStoredNetwork = storedSsid[0] != '\0';
+
+    if (haveStoredNetwork) {
+        WiFi.persistent(false);
+        WiFi.begin(storedSsid, storedPass);
+        memset(storedPass, 0, sizeof(storedPass));
+    }
+
     Serial.printf("[wifi] stored network: %s\n", haveStoredNetwork ? storedSsid : "(none)");
     // NEVER OPEN THE PORTAL OVER A STORED NETWORK. When autoConnect fails it starts the
     // "The Orb Setup" access point, and WiFiManager turns the station side OFF to do it
@@ -3144,13 +4079,13 @@ void setup() {
     // 8 KB of internal RAM, which is the exact resource the feed is starved for.
 
     // configuration web page (http://theorb.local/)
-    g_web.on("/diag", []{ g_web.send(200, "text/plain", diag::text()); });
+    g_web.on("/diag", withAuth([]{ g_web.send(200, "text/plain", diag::text()); }));
     // Does the hand-layer cache draw the same picture as a full compose? In pixels.
     //
     // Over HTTP because the answer takes two full composes (about a second on a heavy
     // design) and because "it looks right" is not a measurement — a layer that came out
     // empty and a layer that is simply mostly transparent produce the same phase timing.
-    g_web.on("/layercheck", []{
+    g_web.on("/layercheck", withAuth([]{
         int worst = -1, wx = -1, wy = -1;
         const long differ = clockview::layerDiffersBy(&worst, &wx, &wy);
         char b[220];
@@ -3164,13 +4099,13 @@ void setup() {
                      "\"worst_at\":[%d,%d]}",
                      differ, (long)(466L * 466L), worst, wx, wy);
         g_web.send(200, "application/json", b);
-    });
+    }));
     // Per-task and heap-fragmentation detail, added for the 2026-08-22 investigation into
     // why ADS-B reads start timing out a minute or two into Flight Tracker. /health already
     // gives one internal-heap number; this is who is holding the rest of it, and how broken
     // up what remains actually is (a device can report 8 KB free and still be unable to
     // satisfy a 2 KB request if that 8 KB is forty scattered 200-byte crumbs).
-    g_web.on("/taskmem", []{
+    g_web.on("/taskmem", withAuth([]{
         multi_heap_info_t hi;
         heap_caps_get_info(&hi, MALLOC_CAP_INTERNAL);
         char b[900];   // the theme-config fields pushed it past 640
@@ -3187,7 +4122,7 @@ void setup() {
             (unsigned)uxTaskGetStackHighWaterMark(nullptr),   // nullptr = the calling (loop) task
             g_radarViewActive ? "true" : "false");
         g_web.send(200, "application/json", b);
-    });
+    }));
     // Reboot on request. Added because capturing the boot log (the only place the PSRAM
     // ledger prints) otherwise means physically unplugging the device, and the serial
     // port cannot be held open during a flash anyway. Deliberately delayed so the HTTP
@@ -3204,7 +4139,7 @@ void setup() {
     //
     // POST, not GET: it erases every baked asset on the device and takes a minute of
     // decoding, so a link preview or a crawler must not be able to set it off.
-    g_web.on("/rebake", HTTP_POST, []{
+    g_web.on("/rebake", HTTP_POST, withAuth([]{
         Serial.println("[theme_art] /rebake: requested; will run at the next boot");
         {   // Remembered, not done now. See the note in loop().
             Preferences p;
@@ -3216,7 +4151,7 @@ void setup() {
                    "the Orb will restart and re-bake the active theme during boot; "
                    "give it a minute, then check bg_frames_baked in /health");
         g_rebootAtMs = millis() + 400;
-    });
+    }));
     // What the active theme actually HAS, declares, and got baked — the three-way comparison
     // that tools/read-orb-bundle.py does for a .orb file, for a theme already on the card.
     //
@@ -3227,7 +4162,7 @@ void setup() {
     //
     // declared = theme.json's asset list said so (nothing undeclared is ever baked).
     // baked    = it is in themeart now, which is the only place frames are read from.
-    g_web.on("/themefiles", []{
+    g_web.on("/themefiles", withAuth([]{
         const char *slug = theme_select::activeSlug();
         char dir[64];
         snprintf(dir, sizeof(dir), "/themes/%s", slug);
@@ -3261,19 +4196,19 @@ void setup() {
         snprintf(line, sizeof(line), "%d file(s)\n", n);
         g_web.sendContent(line, strlen(line));
         g_web.sendContent("", 0);
-    });
-    g_web.on("/reboot", []{
+    }));
+    g_web.on("/reboot", withAuth([]{
         g_web.send(200, "text/plain", "rebooting");
         update_ui::rebooting();     // no-op unless the update overlay is up
         g_rebootAtMs = millis() + 400;
-    });
+    }));
     // Switch the active theme, e.g. /theme?slug=modern. Until this existed, pushing a
     // theme from Launch Kit copied its files onto the card but left the device running
     // whichever theme it was already on, so "push Modern to the Orb" produced the old
     // theme's artwork wearing the new theme's compiled fonts. Settings > Design was the
     // only way to actually select one, which is a menu dive for something the push
     // already knows. theme_select::set() persists to NVS and reboots by itself.
-    g_web.on("/theme", []{
+    g_web.on("/theme", withAuth([]{
         const String slug = g_web.arg("slug");
         if (!slug.length()) { g_web.send(400, "text/plain", "missing slug"); return; }
         // Only switch to a theme that is genuinely on the card; a typo would otherwise
@@ -3290,11 +4225,11 @@ void setup() {
         // HTTP response off before the client ever saw it.
         g_pendingSlug   = slug;
         g_applySlugAtMs = millis() + 400;
-    });
+    }));
     // Diagnostic: hide/show one radar layer live, so each layer's per-frame cost can be
     // priced by watching fps change instead of reflashing once per hypothesis. Nothing
     // persists it; a reboot or re-entering the app puts every layer back.
-    g_web.on("/rdbg", []{
+    g_web.on("/rdbg", withAuth([]{
         if (g_web.hasArg("poll")) {
             g_pollOverrideMs = (uint32_t)g_web.arg("poll").toInt();
             Serial.printf("[adsb] poll interval override -> %lu ms\n", (unsigned long)g_pollOverrideMs);
@@ -3305,12 +4240,12 @@ void setup() {
         const bool hide = (g_web.arg("hide") != "0");
         radar::debugHideLayer(kind, hide);
         g_web.send(200, "text/plain", hide ? "hidden" : "shown");
-    });
+    }));
     // Machine-readable device state, so diagnosis starts from facts instead of from a
     // photograph of the screen (workflow rule R2). largest_block matters as much as
     // free: an allocation can fail with plenty of total free PSRAM if churn has
     // fragmented it below the requested size.
-    g_web.on("/health", []{
+    g_web.on("/health", withAuth([]{
         // 1024, not 640. Measured rather than estimated: a real reading off Zion's Orb on
         // 2026-10-07 was 587 bytes, so 640 had 53 to spare, and the five compose fields
         // below are 70. It would have truncated on the first device that reported them.
@@ -3334,34 +4269,7 @@ void setup() {
                  "\"heap_free_kb\":%u,\"heap_largest_kb\":%u,"
                  "\"fps\":%u,\"lvgl_ms_per_s\":%u,\"flush_ms_per_s\":%u,"
                  "\"screens_per_s\":%u,"
-                 // The allocation CENSUS, not just the free total. Added 2026-10-06 after
-                 // /health showed internal free falling 59 KB -> 11 KB over a 30-minute
-                 // uptime and the device then rebooting: a leak, which "free" alone can
-                 // report but cannot attribute. alloc_blocks climbing is the signature;
-                 // lv_int/lv_allocs say whether LVGL is the one doing it, which is the
-                 // single most useful split because it separates the UI from the network
-                 // stack. The same numbers print to serial as [lvmem]/[memdbg], but a leak
-                 // takes half an hour to show and a cable cannot be left attached that
-                 // long without ESP_RST_USB rebooting the thing being measured.
-                 // Whether the animated background CAN play, which until now was only
-                 // answerable with a cable and a lucky boot. bg_frames is what the theme
-                 // declares, bg_frames_baked is how many of them are actually in themeart.
-                 // Unequal means the partition filled before the frames were reached and
-                 // the dial is stuck on frame 0 — see custom_plate_frame().
-                 // The theme's own answers, because three separate diagnoses in one session
-                 // went wrong through assuming them. Whether the dial sweeps decides which
-                 // compose path runs at all, and loop/fps/everySec decide how often a
-                 // background frame is asked for. All four are in clock_style.json, which
-                 // nothing on the device could report until now.
                  "\"sweep\":%s,\"railway\":%s,\"beat_per_s\":%d,\"bph\":%d,"
-                 // NAMED SO THEY CANNOT BE MISREAD, which the first version was.
-                 //
-                 // bgAnim.frames counts the EXTRA, numbered files; the rotation is
-                 // `% (frames + 1)` and index 0 is the unnumbered clock_plate.png. So a
-                 // theme shipping twelve pictures declares eleven, and reporting the raw
-                 // field as "bg_frames" reads as one of them having gone missing. Report
-                 // what someone actually wants to know: how many pictures are in the loop
-                 // and how long the loop lasts.
                  "\"bg_extra_frames\":%d,\"bg_extra_baked\":%d,"
                  "\"bg_cycle_frames\":%d,\"bg_cycle_s\":%.2f,"
                  "\"bg_fps\":%d,\"bg_loop\":%s,\"bg_every_s\":%d,"
@@ -3394,27 +4302,24 @@ void setup() {
                  (int)(cFace + 0.5f), (int)(cPlate + 0.5f), (int)(cText + 0.5f),
                  (int)(cHands + 0.5f), (int)(cFace - cPlate - cText - cHands + 0.5f),
                  (int)WiFi.RSSI(),
-                 // Was three cases and "other", which reported a USB-triggered reset
-                 // and a panic as the same word. diag_log.cpp owns the full mapping; use
-                 // it rather than keeping a second, shorter copy here that can disagree.
                  diag::resetReasonText());
         g_web.send(200, "application/json", b);
-    });
-    g_web.on("/sdput", HTTP_POST, handleSdPutDone, handleSdPutUpload);   // Launch Kit pushes theme files here
+    }));
+    g_web.on("/sdput", HTTP_POST, withAuth(handleSdPutDone), withAuth(handleSdPutUpload));   // Launch Kit pushes theme files here
     // "I am done sending." Without it the install overlay has no way to tell the end of a
     // transfer from the death of one — see update_ui::installed().
-    g_web.on("/installed", HTTP_POST, []{
+    g_web.on("/installed", HTTP_POST, withAuth([]{
         update_ui::installed(g_sdUpCount);
         g_sdUpCount = 0;
         g_web.send(200, "text/plain", "ok");
-    });
+    }));
     // The page that drives /sdput from a browser, so a theme can arrive over WiFi from any
     // device on the network rather than only down a USB cable from a Chromium desktop.
-    g_web.on("/install", []{ g_web.send_P(200, "text/html", INSTALL_PAGE); });
+    g_web.on("/install", withAuth([]{ g_web.send_P(200, "text/html", INSTALL_PAGE); }));
     // What is on the card, for the page above. The same answer the serial link gives, which
     // matters now that a cable is optional: Studio is served over HTTPS and can never call
     // this, so the device's own page is the only place the card's contents can be seen.
-    g_web.on("/themes.json", []{
+    g_web.on("/themes.json", withAuth([]{
         static char slugs[theme_select::MAX_THEMES][theme_select::MAX_SLUG_LEN];
         const int n = theme_select::listInstalled(slugs);
         String out = "{\"active\":\"";
@@ -3433,8 +4338,8 @@ void setup() {
         }
         out += "]}";
         g_web.send(200, "application/json", out);
-    });
-    g_web.on("/themedel", HTTP_POST, []{
+    }));
+    g_web.on("/themedel", HTTP_POST, withAuth([]{
         const String slug = g_web.arg("slug");
         if (!slug.length()) { g_web.send(400, "text/plain", "missing slug"); return; }
         // removeInstalled refuses the theme being worn: every screen is drawing from that
@@ -3445,35 +4350,43 @@ void setup() {
         }
         Serial.printf("[theme] deleted '%s' by request\n", slug.c_str());
         g_web.send(200, "text/plain", "ok");
-    });
-    g_web.on("/", handleRoot);
-    g_web.on("/legacy", handleLegacyConfig);   // the old configuration form, unadvertised
-    g_web.on("/save", HTTP_POST, handleSave);
-    g_web.on("/wifi", HTTP_POST, handleWifi);
-    g_web.on("/bright", handleBright);
-    g_web.on("/vol", handleVol);
-    g_web.on("/alerts", handleAlerts);
-    g_web.on("/idle", handleIdle);
-    g_web.on("/sweep", handleSweep);
-    g_web.on("/airports", handleAirports);
-    g_web.on("/ground", handleGround);
-    g_web.on("/altmin", handleAltMin);
-    g_web.on("/milonly", handleMilOnly);
-    g_web.on("/trail", handleTrail);
-    g_web.on("/maxac", handleMaxAc);
-    g_web.on("/bigtext", handleBigText);
-    g_web.on("/rotate", handleRotate);
-    g_web.on("/units", handleUnits);
+    }));
+    g_web.on("/", withAuth(handleRoot));
+    g_web.on("/legacy", withAuth(handleLegacyConfig));   // the old configuration form, unadvertised
+    g_web.on("/save", HTTP_POST, withAuth(handleSave));
+    g_web.on("/wifi", HTTP_POST, withAuth(handleWifi));
+    g_web.on("/bright", withAuth(handleBright));
+    g_web.on("/vol", withAuth(handleVol));
+    g_web.on("/alerts", withAuth(handleAlerts));
+    g_web.on("/idle", withAuth(handleIdle));
+    g_web.on("/sweep", withAuth(handleSweep));
+    g_web.on("/airports", withAuth(handleAirports));
+    g_web.on("/ground", withAuth(handleGround));
+    g_web.on("/altmin", withAuth(handleAltMin));
+    g_web.on("/milonly", withAuth(handleMilOnly));
+    g_web.on("/trail", withAuth(handleTrail));
+    g_web.on("/maxac", withAuth(handleMaxAc));
+    g_web.on("/bigtext", withAuth(handleBigText));
+    g_web.on("/rotate", withAuth(handleRotate));
+    g_web.on("/tilt", withAuth(handleRotate));
+    g_web.on("/units", withAuth(handleUnits));
+    g_web.on("/config.json", HTTP_GET, withAuth(handleConfigExport));
+    g_web.on("/config.json", HTTP_POST, withAuth(handleConfigImport));
+    g_web.on("/config", HTTP_GET, withAuth(handleConfigExport));
+    g_web.on("/config", HTTP_POST, withAuth(handleConfigImport));
+    g_web.on("/auth", HTTP_POST, withAuth(handleAuth));
+    g_web.on("/popup", withAuth(handlePopup));
+    g_web.on("/popup/dismiss", withAuth(handlePopupDismiss));
 #if ORB_OTA_ENABLED
-    g_web.on("/update", HTTP_GET, handleUpdatePage);
+    g_web.on("/update", HTTP_GET, withAuth(handleUpdatePage));
     g_web.on("/update", HTTP_POST,
-        []() {
+        withAuth([]() {
             const bool ok = !Update.hasError();
             g_web.send(200, "text/plain", ok ? "OK" : "FAIL");
             delay(800);
             if (ok) ESP.restart();
-        },
-        handleUpdateUpload);
+        }),
+        withAuth(handleUpdateUpload));
 #endif
     g_web.begin();
 
@@ -3609,15 +4522,16 @@ void loop() {
     // MDNS.begin() is now called here explicitly and does not depend on OTA at all.
     static bool mdnsUp = false;
     if (!mdnsUp && WiFi.status() == WL_CONNECTED) {
-        if (!MDNS.begin(ORB_MDNS_HOST)) Serial.println("[mdns] begin failed");
+        if (!MDNS.begin(host_get_name())) Serial.println("[mdns] begin failed");
         MDNS.addService("http", "tcp", 80);            // advertise the config web page
 #if ORB_OTA_ENABLED
-        ArduinoOTA.setHostname(ORB_MDNS_HOST);
+        ArduinoOTA.setHostname(host_get_name());
         ArduinoOTA.begin();
         Serial.println("[ota] ready: pio run -e esp32-s3-amoled-175-ota -t upload");
 #endif
         mdnsUp = true;
-        Serial.println("[mdns] http://" ORB_MDNS_ADDR "/");
+        Serial.printf("[mdns] http://%s.local/\n", host_get_name());
+        resolve_web_dns();
     }
 #if ORB_OTA_ENABLED
     if (mdnsUp) ArduinoOTA.handle();
@@ -3855,14 +4769,8 @@ void loop() {
                              g_locationSet);
         char net[112];
         if (WiFi.status() == WL_CONNECTED)
-            // Two lines, and NO coordinates. UX-028 says what the splash must carry - the
-            // firmware version, the theme's name, its author and the data credits - and the
-            // config address is not on that list at all; it arrived here from the old
-            // touch-only Stats screen and stayed. The centre point was diagnostic rather
-            // than an address, it was the longest string on the screen, and it now lives on
-            // Settings > Location where somebody checking their location will look for it.
-            snprintf(net, sizeof(net), "Configure at " ORB_MDNS_ADDR "\n%s",
-                     WiFi.localIP().toString().c_str());
+            snprintf(net, sizeof(net), "Configure at %s.local\n%s",
+                     host_get_name(), WiFi.localIP().toString().c_str());
         else if (g_wm.getConfigPortalActive())
             snprintf(net, sizeof(net), "WiFi setup:\njoin \"The Orb Setup\"");
         else {

@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+orb-msg: Command-line tool to send popup messages to The Orb over USB Serial.
+
+Usage:
+    ./tools/orb-msg "Hello from terminal"
+    ./tools/orb-msg -t "Calendar" "Meeting starts in 5 minutes"
+    ./tools/orb-msg --dismiss
+    echo "Build succeeded!" | ./tools/orb-msg -t "CI"
+"""
+
+import sys
+import os
+import glob
+import time
+import argparse
+
+def find_default_port():
+    # macOS USB modem / CDC-ACM ports
+    ports = glob.glob("/dev/cu.usbmodem*") + glob.glob("/dev/tty.usbmodem*")
+    if not ports:
+        # Linux CDC-ACM ports
+        ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
+    return ports[0] if ports else None
+
+def send_via_termios(port_path, cmd, timeout=3.0):
+    import termios
+    import select
+
+    # Open serial port non-blocking
+    fd = os.open(port_path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        attrs = termios.tcgetattr(fd)
+        # Configure raw mode at 115200 baud
+        if hasattr(termios, 'B115200'):
+            attrs[4] = termios.B115200  # ispeed
+            attrs[5] = termios.B115200  # ospeed
+        # Raw input/output, 8N1, ignore modem control lines
+        attrs[0] = 0  # iflag
+        attrs[1] = 0  # oflag
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag
+        attrs[3] = 0  # lflag
+        attrs[6][termios.VMIN] = 0
+        attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+        # Clear any stale buffered input
+        time.sleep(0.05)
+        while True:
+            r, _, _ = select.select([fd], [], [], 0)
+            if not r:
+                break
+            os.read(fd, 512)
+
+        # Send command line
+        line = cmd.strip() + "\n"
+        os.write(fd, line.encode("utf-8"))
+
+        # Wait for response line starting with "!orb "
+        deadline = time.time() + timeout
+        buf = b""
+        while time.time() < deadline:
+            remaining = max(0.01, deadline - time.time())
+            r, _, _ = select.select([fd], [], [], min(0.2, remaining))
+            if r:
+                chunk = os.read(fd, 512)
+                if chunk:
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw_line, buf = buf.split(b"\n", 1)
+                        line_str = raw_line.decode("utf-8", errors="replace").strip()
+                        if line_str.startswith("!orb "):
+                            return line_str[5:].strip()
+            else:
+                time.sleep(0.02)
+
+        return None
+    finally:
+        os.close(fd)
+
+def send_via_pyserial(port_path, cmd, timeout=3.0):
+    import serial
+    ser = serial.Serial(port_path, 115200, timeout=0.2)
+    try:
+        ser.reset_input_buffer()
+        line = cmd.strip() + "\n"
+        ser.write(line.encode("utf-8"))
+        ser.flush()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line_bytes = ser.readline()
+            if line_bytes:
+                line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                if line_str.startswith("!orb "):
+                    return line_str[5:].strip()
+        return None
+    finally:
+        ser.close()
+
+def send_command(port, cmd, timeout=3.0):
+    try:
+        import serial
+        return send_via_pyserial(port, cmd, timeout)
+    except ImportError:
+        return send_via_termios(port, cmd, timeout)
+
+def main():
+    parser = argparse.ArgumentParser(description="Send popup messages to The Orb over USB Serial.")
+    parser.add_argument("message", nargs="?", default=None, help="Message body to display on the Orb")
+    parser.add_argument("-t", "--title", default=None, help="Optional notification title (default: Notice)")
+    parser.add_argument("-p", "--port", default=None, help="Serial port (auto-detected if omitted)")
+    parser.add_argument("-d", "--dismiss", action="store_true", help="Dismiss any active popup on the Orb")
+    parser.add_argument("--timeout", type=float, default=3.0, help="Response timeout in seconds")
+
+    args = parser.parse_args()
+
+    port = args.port or find_default_port()
+    if not port:
+        sys.stderr.write("Error: Could not find an Orb USB device. Specify port with -p / --port\n")
+        sys.exit(1)
+
+    if args.dismiss:
+        cmd = "?orb popup-dismiss"
+        resp = send_command(port, cmd, timeout=args.timeout)
+        if resp:
+            print(f"Dismissed popup on Orb via {port} ({resp})")
+            sys.exit(0)
+        else:
+            sys.stderr.write(f"Warning: No response from Orb on {port} (sent dismiss command)\n")
+            sys.exit(0)
+
+    # Determine message text
+    msg = args.message
+    if not msg:
+        if not sys.stdin.isatty():
+            msg = sys.stdin.read().strip()
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    if not msg:
+        sys.stderr.write("Error: Empty message.\n")
+        sys.exit(1)
+
+    # Format command
+    if args.title:
+        cmd = f"?orb popup {args.title}|{msg}"
+    else:
+        cmd = f"?orb popup {msg}"
+
+    resp = send_command(port, cmd, timeout=args.timeout)
+    if resp:
+        title_str = f" [{args.title}]" if args.title else ""
+        print(f"Sent message to Orb via {port}:{title_str} \"{msg}\"")
+        sys.exit(0)
+    else:
+        sys.stderr.write(f"Warning: Sent message to Orb on {port}, but timed out waiting for acknowledgment.\n")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
