@@ -57,6 +57,8 @@ void wx_map_prepare(double lat, double lon, int tier);
 void wx_plate_set(const uint16_t *src466, int w, int h);   // UI thread; nullptr clears it
 bool wx_plate_have();
 void wx_plate_blit(uint16_t *dst360);   // network task: lay it down as the frame's base
+uint16_t *wx_plate_crop_buffer(void);   // UI thread: returns 360x360 PSRAM buffer, allocated on demand
+void      wx_plate_set_have(bool have); // UI thread: update have-plate state
 
 // WHAT THE WEATHER APP IS DOING RIGHT NOW, so the screen can say so.
 //

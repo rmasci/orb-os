@@ -337,6 +337,19 @@ void wx_plate_set(const uint16_t *src, int w, int h) {
     Serial.printf("[wxradar] background picture cropped to %dx%d\n", WX_RADAR_SIZE, WX_RADAR_SIZE);
 }
 
+uint16_t *wx_plate_crop_buffer(void) {
+    if (!s_plateCrop) {
+        s_plateCrop = (uint16_t *)heap_caps_malloc((size_t)WX_RADAR_SIZE * WX_RADAR_SIZE * sizeof(uint16_t),
+                                                   MALLOC_CAP_SPIRAM);
+        if (!s_plateCrop) { Serial.println("[wxradar] no PSRAM for the background crop"); return nullptr; }
+    }
+    return s_plateCrop;
+}
+
+void wx_plate_set_have(bool have) {
+    s_plateHave = have && (s_plateCrop != nullptr);
+}
+
 void wx_map_prepare(double lat, double lon, int tier) {
     const theme_style::Weather &wx = theme_style::weather();
     if (!wx.roadsEnabled && !wx.coastEnabled) return;

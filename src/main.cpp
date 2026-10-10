@@ -64,6 +64,7 @@
 #include "intel_view.h"
 #include "ticker_view.h"
 #include "ticker.h"              // world headlines, read through the gateway
+#include "wx_map_fetch.h"        // automatic radar base map fetch and cache
 #include <set>                       // audio: track which contacts are in range
 #include <string>
 #include <WiFiManager.h>             // captive portal
@@ -1105,6 +1106,9 @@ static void radar_show_weather() {
     // task only ever blits the finished masks. Returns immediately if this centre is built.
     wx_phase_set(WX_PHASE_MAP);
     ui_weather_art_attach();
+    if (!theme_style::hasAsset("weather_plate.png") && g_locationSet) {
+        wx_map_fetch::ensure(g_settings.homeLat, g_settings.homeLon);
+    }
     wx_map_prepare(g_settings.homeLat, g_settings.homeLon, g_wxZoomTier);
     ui_show_view(1);   // tile 1 since list/stats went
 }
@@ -1291,6 +1295,7 @@ static void apply_location_live(double lat, double lon) {
     // stale/zero g_requeryKm and fetches 0 aircraft.
     g_requeryKm = queryRadiusKm();
     g_requery = true;
+    wx_map_fetch::invalidate();
 }
 
 // Forget that a location was ever established, and nothing else. Debug channel only
@@ -1335,10 +1340,18 @@ void host_location_reset() {
 // instead, because nobody asked it for anything.
 void host_set_location(double lat, double lon) {
     persist_location(lat, lon);
+    wx_map_fetch::invalidate();
 
     if (g_holdWarning && g_holdWarningLbl) {
         lv_obj_clear_flag(g_holdWarning, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_holdWarning);
+        lv_label_set_text(g_holdWarningLbl, "LOCATION SAVED\n\nFETCHING MAP...");
+        lv_refr_now(NULL);
+
+        if (WiFi.status() == WL_CONNECTED) {
+            wx_map_fetch::download_and_cache(lat, lon, nullptr);
+        }
+
         for (int s = 3; s >= 1; s--) {
             char buf[48];
             snprintf(buf, sizeof(buf), "LOCATION SAVED\n\nRESTARTING IN %ds", s);
@@ -1347,6 +1360,9 @@ void host_set_location(double lat, double lon) {
             delay(1000);
         }
     } else {
+        if (WiFi.status() == WL_CONNECTED) {
+            wx_map_fetch::download_and_cache(lat, lon, nullptr);
+        }
         delay(250);
     }
     ESP.restart();

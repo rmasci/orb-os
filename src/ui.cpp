@@ -1567,7 +1567,9 @@ void ui_weather_art_attach(void) {
         wx_plate_set((const uint16_t *)art->data, art->header.w, art->header.h);
     } else {
         lv_obj_add_flag(s_wxPlate, LV_OBJ_FLAG_HIDDEN);
-        wx_plate_set(nullptr, 0, 0);
+        if (!wx_plate_have()) {
+            wx_plate_set(nullptr, 0, 0);
+        }
     }
 }
 
