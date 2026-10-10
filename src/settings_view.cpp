@@ -78,7 +78,7 @@ extern void  host_set_range_km(float km);
 namespace {
     // MODE_LOCATION is a 4-item menu (current / search / recent / back); MODE_RECENT is
     // the scrollable list of recent cities you reach from that menu.
-    enum Mode { MODE_MENU, MODE_DISPLAY, MODE_BRIGHT, MODE_TILT, MODE_LOCATION, MODE_RECENT, MODE_SEARCH, MODE_SOUND, MODE_VOLUME, MODE_ABOUT,
+    enum Mode { MODE_MENU, MODE_DISPLAY, MODE_BRIGHT, MODE_TILT, MODE_LOCATION, MODE_RECENT, MODE_SEARCH, MODE_ZIP, MODE_SOUND, MODE_VOLUME, MODE_ABOUT,
                 MODE_WIFI_LIST, MODE_WIFI_PASSWORD, MODE_WIFI_STATUS, MODE_RESET_CONFIRM, MODE_UNITS, MODE_CHIME_SELECT,
                 MODE_THEME_SELECT, MODE_THEME_NOTICE, MODE_DESIGN_SELECT, MODE_DESIGN_NOTICE, MODE_RANGE,
                 MODE_FIRSTBOOT, MODE_FIRSTBOOT_PHONE, MODE_NO_SDCARD, MODE_WEB };
@@ -238,8 +238,6 @@ namespace {
     // Search keyboard: 10 digits, 26 letters, a comma, '<' (backspace) and '_' (space).
     const char KEYS[]     = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ,<_";
     const int  N_KEYS     = (int)(sizeof(KEYS) - 1);
-    const char ZIP_KEYS[] = "0123456789<";
-    const int  N_ZIP_KEYS = (int)(sizeof(ZIP_KEYS) - 1);
 
     constexpr int BRI_MIN = 8, BRI_MAX = 255, BRI_STEP = 13;
 
@@ -314,7 +312,6 @@ namespace {
 
     // search state
     char   s_str[48]   = "";
-    bool   s_isZipMode = false;
     int    s_kbIdx     = 0;
     char   s_sugName[4][40];
     double s_sugLat[4], s_sugLon[4];
@@ -322,6 +319,15 @@ namespace {
     bool   s_pending   = false;
     int    s_countdown = 0;
     bool   s_searching = false;
+
+    // zip code entry state & widgets
+    char      s_zipCode[8]       = "";
+    int       s_zipSel           = 0;   // 0..9 digits, 10 is '<'
+    char      s_zipCityName[40]  = "";
+    double    s_zipLat           = 0;
+    double    s_zipLon           = 0;
+    bool      s_zipFound         = false;
+    bool      s_zipSearching     = false;
 
     lv_obj_t *s_screen  = nullptr;
     // The two repeating timers, so destroy() can stop them. See the note where they
@@ -347,6 +353,14 @@ namespace {
     lv_obj_t *s_srchText= nullptr;
     lv_obj_t *s_strip[7]= { nullptr };
     lv_obj_t *s_sug[4]  = { nullptr };
+    lv_obj_t *s_zipPage = nullptr;
+    lv_obj_t *s_zipTitle = nullptr;
+    lv_obj_t *s_zipKeys[11] = { nullptr };
+    lv_obj_t *s_zipUnderline = nullptr;
+    lv_obj_t *s_zipSlot[5] = { nullptr };
+    lv_obj_t *s_zipSlotBar[5] = { nullptr };
+    lv_obj_t *s_zipCity = nullptr;
+    lv_obj_t *s_zipHint = nullptr;
     lv_obj_t *s_dspPage = nullptr;   // display menu (screen timeout + brightness)
     lv_obj_t *s_dspHl   = nullptr;
     lv_obj_t *s_dspItems[DSP_COUNT] = { nullptr };
@@ -948,15 +962,13 @@ namespace {
     }
 
     void refresh_search() {
-        const char *keys = s_isZipMode ? ZIP_KEYS : KEYS;
-        const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
-        lv_label_set_text(s_srchText, s_str[0] ? s_str : (s_isZipMode ? "enter zip code" : "city or zip code"));
-        const bool inKeys = (s_kbIdx < n_keys);
-        const int  center = inKeys ? s_kbIdx : n_keys - 1;
+        lv_label_set_text(s_srchText, s_str[0] ? s_str : "type a city name");
+        const bool inKeys = (s_kbIdx < N_KEYS);
+        const int  center = inKeys ? s_kbIdx : N_KEYS - 1;
         for (int k = 0; k < 7; ++k) {
             const int idx = center - 3 + k;
             char c[2] = { 0, 0 };
-            if (idx >= 0 && idx < n_keys) c[0] = keys[idx];
+            if (idx >= 0 && idx < N_KEYS) c[0] = KEYS[idx];
             lv_label_set_text(s_strip[k], c);
             const bool hot = inKeys && (k == 3);
             lv_obj_set_style_text_color(s_strip[k], hot ? C_WHITE : C_GREY, 0);
@@ -970,9 +982,71 @@ namespace {
             for (int j = 0; j < 4; ++j) {
                 if (j < s_sugCount) {
                     lv_label_set_text(s_sug[j], s_sugName[j]);
-                    const bool hot = !inKeys && (s_kbIdx - n_keys == j);
+                    const bool hot = !inKeys && (s_kbIdx - N_KEYS == j);
                     lv_obj_set_style_text_color(s_sug[j], hot ? C_ACCENT : C_DIM, 0);
                 } else lv_label_set_text(s_sug[j], "");
+            }
+        }
+    }
+
+    void refresh_zip() {
+        if (!s_zipPage) return;
+
+        // Number keys 0 1 2 3 4 5 6 7 8 9 <
+        // Selected key is bold & underline, NO color change (pure C_WHITE)
+        for (int k = 0; k < 11; ++k) {
+            bool sel = (k == s_zipSel);
+            lv_obj_set_style_text_color(s_zipKeys[k], C_WHITE, 0);
+            lv_obj_set_style_text_font(s_zipKeys[k], sel ? &lv_font_montserrat_28 : &lv_font_montserrat_20, 0);
+            lv_obj_align(s_zipKeys[k], LV_ALIGN_CENTER, (k - 5) * 36, -48);
+        }
+
+        // Underline bar glides directly under selected key
+        lv_obj_set_style_bg_color(s_zipUnderline, C_WHITE, 0);
+        lv_obj_align(s_zipUnderline, LV_ALIGN_CENTER, (s_zipSel - 5) * 36, -26);
+
+        // 5 Zip code slots: __ __ __ __ __
+        int len = (int)strlen(s_zipCode);
+        for (int i = 0; i < 5; ++i) {
+            if (i < len) {
+                char c[2] = { s_zipCode[i], '\0' };
+                lv_label_set_text(s_zipSlot[i], c);
+                lv_obj_set_style_text_color(s_zipSlot[i], C_WHITE, 0);
+                lv_obj_set_style_bg_color(s_zipSlotBar[i], C_WHITE, 0);
+                lv_obj_set_style_bg_opa(s_zipSlotBar[i], LV_OPA_COVER, 0);
+            } else {
+                lv_label_set_text(s_zipSlot[i], "");
+                bool isCursor = (i == len);
+                lv_obj_set_style_bg_color(s_zipSlotBar[i], isCursor ? C_WHITE : C_DIM, 0);
+                lv_obj_set_style_bg_opa(s_zipSlotBar[i], isCursor ? LV_OPA_COVER : (LV_OPA_COVER * 5 / 10), 0);
+            }
+        }
+
+        // City & hint feedback
+        if (len == 5) {
+            if (s_zipSearching) {
+                lv_label_set_text(s_zipCity, "Looking up...");
+                lv_obj_set_style_text_color(s_zipCity, C_GREY, 0);
+                lv_label_set_text(s_zipHint, "searching location...");
+            } else if (s_zipFound) {
+                lv_label_set_text(s_zipCity, s_zipCityName);
+                lv_obj_set_style_text_color(s_zipCity, C_ACCENT, 0);
+                if (s_zipSel == 10) {
+                    lv_label_set_text(s_zipHint, "push < to delete digit");
+                } else {
+                    lv_label_set_text(s_zipHint, "push or tap to set location");
+                }
+            } else {
+                lv_label_set_text(s_zipCity, s_zipCityName[0] ? s_zipCityName : "Zip code not found");
+                lv_obj_set_style_text_color(s_zipCity, lv_color_hex(0xFF6B6B), 0);
+                lv_label_set_text(s_zipHint, "turn to < and push to edit");
+            }
+        } else {
+            lv_label_set_text(s_zipCity, "");
+            if (s_zipSel == 10) {
+                lv_label_set_text(s_zipHint, len > 0 ? "push < to delete digit" : "push < to exit");
+            } else {
+                lv_label_set_text(s_zipHint, "turn to select, push to enter");
             }
         }
     }
@@ -1111,12 +1185,14 @@ namespace {
         lv_obj_add_flag(s_themeNoticePage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_designPage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_designNoticePage, LV_OBJ_FLAG_HIDDEN);
+        if (s_zipPage) lv_obj_add_flag(s_zipPage, LV_OBJ_FLAG_HIDDEN);
         if (m == MODE_MENU)          { lv_obj_clear_flag(s_menu, LV_OBJ_FLAG_HIDDEN);    refresh_menu(); }
         else if (m == MODE_DISPLAY)  { lv_obj_clear_flag(s_dspPage, LV_OBJ_FLAG_HIDDEN); refresh_display(); }
         else if (m == MODE_BRIGHT)   { lv_obj_clear_flag(s_bright, LV_OBJ_FLAG_HIDDEN);  refresh_bright(); }
         else if (m == MODE_TILT)     { lv_obj_clear_flag(s_tiltPage, LV_OBJ_FLAG_HIDDEN); refresh_tilt(); }
         else if (m == MODE_LOCATION) { lv_obj_clear_flag(s_lmPage, LV_OBJ_FLAG_HIDDEN);  refresh_locmenu(); }
         else if (m == MODE_RECENT)   { lv_obj_clear_flag(s_recPage, LV_OBJ_FLAG_HIDDEN); refresh_recent(); }
+        else if (m == MODE_ZIP)      { lv_obj_clear_flag(s_zipPage, LV_OBJ_FLAG_HIDDEN); refresh_zip(); }
         else if (m == MODE_SOUND)    { lv_obj_clear_flag(s_sndPage, LV_OBJ_FLAG_HIDDEN); refresh_sound(); }
         else if (m == MODE_CHIME_SELECT) { lv_obj_clear_flag(s_chimeSelPage, LV_OBJ_FLAG_HIDDEN); refresh_chimeSelect(); }
         else if (m == MODE_UNITS)    { lv_obj_clear_flag(s_unitsPage, LV_OBJ_FLAG_HIDDEN); refresh_units(); }
@@ -1144,8 +1220,7 @@ namespace {
         if (s_mode != MODE_SEARCH) return;
         if (s_searching) {                        // "searching" is already painted; do the blocking fetch now
             s_searching = false;
-            const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
-            const int total = n_keys + s_sugCount;
+            const int total = N_KEYS + s_sugCount;
             if (s_kbIdx >= total) s_kbIdx = total - 1;
             refresh_search();
             return;
@@ -1493,9 +1568,13 @@ void settingsview::onTurn(int delta) {
     } else if (s_mode == MODE_RESET_CONFIRM) {
         s_sel = ITEM_RESET;      // turning either way backs out — this page is confirm/cancel only
         show_page(MODE_MENU);
+    } else if (s_mode == MODE_ZIP) {
+        s_zipSel += step;
+        if (s_zipSel < 0) s_zipSel = 0;
+        if (s_zipSel > 10) s_zipSel = 10;
+        refresh_zip();
     } else {  // MODE_SEARCH
-        const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
-        const int total = n_keys + s_sugCount;
+        const int total = N_KEYS + s_sugCount;
         s_kbIdx += step;
         if (s_kbIdx < 0) s_kbIdx = 0;
         if (s_kbIdx >= total) s_kbIdx = total - 1;
@@ -1761,11 +1840,13 @@ void settingsview::onPress() {
             host_locate_current();                      // reboots on success
             lv_label_set_text(s_lmItems[LM_CURRENT], LM_LABELS[LM_CURRENT]);  // came back = failed
         } else if (s_lmSel == LM_ZIP) {
-            s_isZipMode = true;
-            s_str[0] = 0; s_kbIdx = 0; s_sugCount = 0; s_pending = false; s_searching = false;
-            show_page(MODE_SEARCH);
+            s_zipCode[0] = 0;
+            s_zipSel = 0;
+            s_zipCityName[0] = 0;
+            s_zipFound = false;
+            s_zipSearching = false;
+            show_page(MODE_ZIP);
         } else if (s_lmSel == LM_SEARCH) {
-            s_isZipMode = false;
             s_str[0] = 0; s_kbIdx = 0; s_sugCount = 0; s_pending = false; s_searching = false;
             show_page(MODE_SEARCH);
         } else if (s_lmSel == LM_RECENT) {
@@ -1781,12 +1862,71 @@ void settingsview::onPress() {
         else {                                          // Back (or empty list) -> Location menu
             show_page(MODE_LOCATION);
         }
+    } else if (s_mode == MODE_ZIP) {
+        int len = (int)strlen(s_zipCode);
+        if (s_zipSel == 10) { // '<' (backspace / exit)
+            if (len > 0) {
+                s_zipCode[len - 1] = '\0';
+                s_zipFound = false;
+                s_zipCityName[0] = '\0';
+                refresh_zip();
+            } else {
+                show_page(MODE_LOCATION);
+            }
+        } else if (len == 5 && s_zipFound) {
+            // Already resolved: push or tap saves location & reboots
+            host_set_location_named(s_zipCityName, s_zipLat, s_zipLon);
+        } else if (len == 5 && !s_zipFound) {
+            // Replace 5th digit and retry lookup
+            s_zipCode[4] = '0' + s_zipSel;
+            s_zipSearching = true;
+            refresh_zip();
+            lv_refr_now(NULL);
+            char names[4][40];
+            double lats[4], lons[4];
+            int n = host_geocode(s_zipCode, names, lats, lons, 1);
+            s_zipSearching = false;
+            if (n > 0) {
+                strncpy(s_zipCityName, names[0], sizeof(s_zipCityName) - 1);
+                s_zipCityName[sizeof(s_zipCityName) - 1] = '\0';
+                s_zipLat = lats[0];
+                s_zipLon = lons[0];
+                s_zipFound = true;
+            } else {
+                s_zipFound = false;
+                strncpy(s_zipCityName, "Zip code not found", sizeof(s_zipCityName) - 1);
+            }
+            refresh_zip();
+        } else if (len < 5) {
+            s_zipCode[len] = '0' + s_zipSel;
+            s_zipCode[len + 1] = '\0';
+            len++;
+            if (len == 5) {
+                s_zipSearching = true;
+                refresh_zip();
+                lv_refr_now(NULL);
+                char names[4][40];
+                double lats[4], lons[4];
+                int n = host_geocode(s_zipCode, names, lats, lons, 1);
+                s_zipSearching = false;
+                if (n > 0) {
+                    strncpy(s_zipCityName, names[0], sizeof(s_zipCityName) - 1);
+                    s_zipCityName[sizeof(s_zipCityName) - 1] = '\0';
+                    s_zipLat = lats[0];
+                    s_zipLon = lons[0];
+                    s_zipFound = true;
+                } else {
+                    s_zipFound = false;
+                    strncpy(s_zipCityName, "Zip code not found", sizeof(s_zipCityName) - 1);
+                }
+                refresh_zip();
+            } else {
+                refresh_zip();
+            }
+        }
     } else {  // MODE_SEARCH
-        const char *keys = s_isZipMode ? ZIP_KEYS : KEYS;
-        const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
         const int L = (int)strlen(s_str);
-        // WHICH KEY, by the character it is, not by where it sits.
-        const char key = (s_kbIdx >= 0 && s_kbIdx < n_keys) ? keys[s_kbIdx] : '\0';
+        const char key = (s_kbIdx >= 0 && s_kbIdx < N_KEYS) ? KEYS[s_kbIdx] : '\0';
         if (key == '<') {                                   // backspace (empty -> exit search)
             if (L > 0) { s_str[L - 1] = 0; mark_dirty(); }
             else { show_page(MODE_LOCATION); }          // exit to Location menu
@@ -1797,7 +1937,7 @@ void settingsview::onPress() {
             if (L < (int)sizeof(s_str) - 1) { s_str[L] = key; s_str[L + 1] = 0; }
             mark_dirty();
         } else {                                            // a suggestion
-            const int j = s_kbIdx - n_keys;
+            const int j = s_kbIdx - N_KEYS;
             if (j >= 0 && j < s_sugCount) host_set_location_named(s_sugName[j], s_sugLat[j], s_sugLon[j]);
         }
     }
@@ -2149,6 +2289,64 @@ void settingsview::init() {
     lv_obj_set_style_text_color(shint, C_GREY, 0);
     lv_obj_set_style_text_font(shint, &lv_font_montserrat_14, 0);
     lv_obj_align(shint, LV_ALIGN_CENTER, 0, 150);
+
+    // --- zip code entry page ---
+    s_zipPage = lv_obj_create(s_screen);
+    lv_obj_remove_style_all(s_zipPage);
+    lv_obj_set_size(s_zipPage, SCREEN_W, SCREEN_H); lv_obj_center(s_zipPage);
+    lv_obj_clear_flag(s_zipPage, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_zipTitle = lv_label_create(s_zipPage);
+    lv_label_set_text(s_zipTitle, "Enter Zip Code");
+    lv_obj_set_style_text_color(s_zipTitle, C_GREY, 0);
+    lv_obj_set_style_text_font(s_zipTitle, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_zipTitle, LV_ALIGN_CENTER, 0, -115);
+
+    const char ZIP_CHARS[12] = "0123456789<";
+    for (int k = 0; k < 11; ++k) {
+        s_zipKeys[k] = lv_label_create(s_zipPage);
+        char buf[2] = { ZIP_CHARS[k], '\0' };
+        lv_label_set_text(s_zipKeys[k], buf);
+        lv_obj_set_style_text_color(s_zipKeys[k], C_WHITE, 0);
+        lv_obj_set_style_text_font(s_zipKeys[k], &lv_font_montserrat_20, 0);
+        lv_obj_align(s_zipKeys[k], LV_ALIGN_CENTER, (k - 5) * 36, -48);
+    }
+
+    s_zipUnderline = lv_obj_create(s_zipPage);
+    lv_obj_remove_style_all(s_zipUnderline);
+    lv_obj_set_size(s_zipUnderline, 24, 3);
+    lv_obj_set_style_bg_color(s_zipUnderline, C_WHITE, 0);
+    lv_obj_set_style_bg_opa(s_zipUnderline, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_zipUnderline, 1, 0);
+    lv_obj_align(s_zipUnderline, LV_ALIGN_CENTER, -180, -26);
+
+    for (int i = 0; i < 5; ++i) {
+        s_zipSlot[i] = lv_label_create(s_zipPage);
+        lv_label_set_text(s_zipSlot[i], "");
+        lv_obj_set_style_text_color(s_zipSlot[i], C_WHITE, 0);
+        lv_obj_set_style_text_font(s_zipSlot[i], &lv_font_montserrat_28, 0);
+        lv_obj_align(s_zipSlot[i], LV_ALIGN_CENTER, (i - 2) * 44, 18);
+
+        s_zipSlotBar[i] = lv_obj_create(s_zipPage);
+        lv_obj_remove_style_all(s_zipSlotBar[i]);
+        lv_obj_set_size(s_zipSlotBar[i], 32, 3);
+        lv_obj_set_style_bg_color(s_zipSlotBar[i], C_DIM, 0);
+        lv_obj_set_style_bg_opa(s_zipSlotBar[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(s_zipSlotBar[i], 1, 0);
+        lv_obj_align(s_zipSlotBar[i], LV_ALIGN_CENTER, (i - 2) * 44, 42);
+    }
+
+    s_zipCity = lv_label_create(s_zipPage);
+    lv_label_set_text(s_zipCity, "");
+    lv_obj_set_style_text_color(s_zipCity, C_ACCENT, 0);
+    lv_obj_set_style_text_font(s_zipCity, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_zipCity, LV_ALIGN_CENTER, 0, 85);
+
+    s_zipHint = lv_label_create(s_zipPage);
+    lv_label_set_text(s_zipHint, "turn to select, push to enter");
+    lv_obj_set_style_text_color(s_zipHint, C_GREY, 0);
+    lv_obj_set_style_text_font(s_zipHint, &lv_font_montserrat_14, 0);
+    lv_obj_align(s_zipHint, LV_ALIGN_CENTER, 0, 140);
 
     // --- display menu page (Screen timeout / Brightness / Back) ---
     s_dspPage = lv_obj_create(s_screen);
@@ -2731,6 +2929,14 @@ void settingsview::destroy() {
     memset(s_unitsItems, 0, sizeof(s_unitsItems));
     memset(s_wifiRows, 0, sizeof(s_wifiRows));
     memset(s_wkStrip, 0, sizeof(s_wkStrip));
+    s_zipPage = nullptr;
+    s_zipTitle = nullptr;
+    s_zipUnderline = nullptr;
+    s_zipCity = nullptr;
+    s_zipHint = nullptr;
+    memset(s_zipKeys, 0, sizeof(s_zipKeys));
+    memset(s_zipSlot, 0, sizeof(s_zipSlot));
+    memset(s_zipSlotBar, 0, sizeof(s_zipSlotBar));
     // Back to the state a fresh build expects, so a rebuild opens on the menu rather than
     // on whatever sub-page the user happened to leave from.
     s_mode = MODE_MENU;
@@ -2789,7 +2995,6 @@ const char *settingsview::searchType(char c) {
     const char *at = strchr(KEYS, c);
     if (!at) return s_str;
     s_mode      = MODE_SEARCH;
-    s_isZipMode = false;
     s_kbIdx     = (int)(at - KEYS);
     settingsview::onPress();
     return s_str;
