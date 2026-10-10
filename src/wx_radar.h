@@ -108,3 +108,8 @@ uint32_t wx_radar_gen(void);              // newest generation any slot holds (0
 int      wx_radar_gen_count(uint32_t gen); // how many slots (from 0 up) are filled for that gen
 uint32_t wx_radar_version(void);          // bumps on every commit — UI uses it to drop the "UPDATING" overlay
 bool     wx_radar_center(double *lat, double *lon);   // center of the frames currently held
+
+// Ring-buffer update helpers for fast 60s polling
+uint32_t wx_radar_latest_time(void);      // epoch timestamp of newest frame (slot WX_RADAR_FRAMES-1)
+bool     wx_radar_has_valid_frames(void); // true if all 5 slots are populated
+void     wx_radar_shift_ring_and_commit(uint32_t gen, uint32_t frameTime, double lat, double lon);

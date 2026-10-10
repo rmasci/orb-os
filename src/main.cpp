@@ -713,26 +713,16 @@ static void adsb_task(void*) {
                 wxFillIdx = 0; ++wxGen; nextWxRadarAt = nowMs;
             }
             // Opened: take the buffers and start a cycle NOW rather than waiting out the
-            // five-minute refresh in front of somebody who just asked to see the weather.
+            // polling interval in front of somebody who just asked to see the weather.
             if (g_wxOpened) {
                 g_wxOpened = false;
                 wx_phase_set(WX_PHASE_BUFFERS);
                 wx_radar_begin();
                 wxFillIdx = 0; ++wxGen; nextWxRadarAt = nowMs;
                 wx_phase_set(WiFi.status() == WL_CONNECTED ? WX_PHASE_INDEX : WX_PHASE_NO_WIFI);
+                Serial.println("[wxradar] app opened: fetching fresh 5-frame sequence");
             }
-            // Closed: give them back, but only from here, and only while idle. wxFillIdx ==
-            // WX_RADAR_FRAMES means no frame is part-way through, which is the only moment
-            // it is safe: this task is the one that writes into them.
-            // The app has gone: abandon whatever is left of the current cycle rather than
-            // finishing it. Each remaining frame is a PNG fetched and decoded for a screen
-            // nobody is looking at, several seconds apiece, and until the cycle ends the
-            // gate below cannot take the 1.2 MB back. Measured stuck at frame 1 of 5 with
-            // the app closed, holding the lot.
-            //
-            // Safe HERE and nowhere else, for the same reason the release itself is: this is
-            // the top of the network task's loop, so the fetch that was in flight has
-            // already returned and no frame is part-way through being written.
+            // Closed: abandon whatever is left of the current fill cycle if app is closed.
             if (g_wxClosed && wxFillIdx < WX_RADAR_FRAMES) {
                 Serial.printf("[wxradar] app closed at frame %d/%d; dropping the rest\n",
                               wxFillIdx, WX_RADAR_FRAMES);
@@ -741,47 +731,38 @@ static void adsb_task(void*) {
             if (g_wxClosed && wxFillIdx >= WX_RADAR_FRAMES) {
                 g_wxClosed = false;
                 wx_radar_release();
-                // The road and coastline masks are NOT freed here. They are 16 KB each and
-                // they are the one thing both threads can see, so keeping them makes "the
-                // network task is mid-blit while the app closes" a non-question rather than
-                // a window to be narrowed. The 1.2 MB of frame buffers is what matters.
                 wx_phase_set(WX_PHASE_IDLE);
             }
 
-            // A refresh must not start for an app nobody is looking at. Without the
-            // !g_wxClosed here, the periodic timer kept arming a new cycle behind the closed
-            // app: wxFillIdx went back to zero before the release gate above could ever
-            // catch it idle, so 1.2 MB of frame buffers stayed held for the rest of the
-            // session. The release was written to wait for a quiet moment and the refresh
-            // guaranteed there was never one.
-            //
-            // Blocking the whole timer instead was worse and I tried it first: a cycle that
-            // was part-way through when the app closed then never finished either, so
-            // wxFillIdx never reached the value the gate waits for and the buffers were held
-            // just the same. An in-flight fetch has to be allowed to complete, because the
-            // task doing it is writing into those buffers and taking them away mid-write is
-            // the hang this whole handshake exists to avoid.
+            // Fast 60s poll when loop is populated:
             if (wxFillIdx >= WX_RADAR_FRAMES && (int32_t)(nowMs - nextWxRadarAt) >= 0
                 && wx_radar_ready() && !g_wxClosed) {
-                wxFillIdx = 0; ++wxGen;                // periodic refresh: start a new loop
+                const int r = wx_radar_poll_update(g_settings.homeLat, g_settings.homeLon,
+                                                   g_wxZoomTier, wxGen);
+                if (r == 1) {
+                    g_wxRadarDirty = true;             // New frame committed smoothly into slot 4
+                    nextWxRadarAt = millis() + WX_RADAR_POLL_MS;
+                } else if (r == 0) {
+                    nextWxRadarAt = millis() + WX_RADAR_POLL_MS;
+                } else {
+                    nextWxRadarAt = millis() + 30000UL; // Retry metadata in 30s on error
+                }
             }
+            // Initial frame fill (0 .. WX_RADAR_FRAMES-1):
             if (wxFillIdx < WX_RADAR_FRAMES && (int32_t)(nowMs - nextWxRadarAt) >= 0) {
                 const int r = wx_radar_fetch_frame(g_settings.homeLat, g_settings.homeLon,
                                                    g_wxZoomTier, wxGen, wxFillIdx);
                 if (r == 1) {
                     g_wxRadarDirty = true;             // new frame committed
                     wxFillIdx++;
-                    // Only READY once the whole loop is up. Saying so at the first frame
-                    // would clear the notice over a map that still has four frames missing,
-                    // and the animation would visibly stutter into life afterwards.
                     wx_phase_set(wxFillIdx >= WX_RADAR_FRAMES ? WX_PHASE_READY : WX_PHASE_FRAMES,
                                  wxFillIdx, WX_RADAR_FRAMES);
-                    nextWxRadarAt = millis() + (wxFillIdx >= WX_RADAR_FRAMES ? WX_RADAR_REFRESH_MS : 250UL);
+                    nextWxRadarAt = millis() + (wxFillIdx >= WX_RADAR_FRAMES ? WX_RADAR_POLL_MS : 250UL);
                 } else if (r == 0) {                   // fewer frames than the loop length — cycle done
                     if (wxFillIdx > 0) g_wxRadarDirty = true;
                     wx_phase_set(wxFillIdx > 0 ? WX_PHASE_READY : WX_PHASE_FAILED, wxFillIdx, WX_RADAR_FRAMES);
                     wxFillIdx = WX_RADAR_FRAMES;
-                    nextWxRadarAt = millis() + WX_RADAR_REFRESH_MS;
+                    nextWxRadarAt = millis() + WX_RADAR_POLL_MS;
                 } else {                               // error — retry the whole cycle in 60s
                     wx_phase_set(WiFi.status() == WL_CONNECTED ? WX_PHASE_FAILED : WX_PHASE_NO_WIFI,
                                  wxFillIdx, WX_RADAR_FRAMES);
@@ -1104,7 +1085,12 @@ static void radar_show_weather() {
     // The map under the weather is built HERE, on the UI thread, because it reads road tiles
     // off the SD card and the driver cannot take that from two tasks at once. The network
     // task only ever blits the finished masks. Returns immediately if this centre is built.
-    wx_phase_set(WX_PHASE_MAP);
+    double cLat = 0, cLon = 0;
+    const bool haveCenter = wx_radar_center(&cLat, &cLon);
+    const bool sameLoc = haveCenter && (fabs(cLat - g_settings.homeLat) < 0.005) && (fabs(cLon - g_settings.homeLon) < 0.005);
+    if (!wx_radar_has_valid_frames() || !sameLoc) {
+        wx_phase_set(WX_PHASE_MAP);
+    }
     ui_weather_art_attach();
     if (!theme_style::hasAsset("weather_plate.png") && g_locationSet) {
         wx_map_fetch::ensure(g_settings.homeLat, g_settings.homeLon);
@@ -1117,7 +1103,7 @@ static void radar_hide_weather() {
     ui_weather_art_release();   // UI thread, so the plate goes back here rather than by flag
     g_wxOpened = false;
     g_wxClosed = true;
-    Serial.println("[wxradar] app closed; buffers will go back at the next idle moment");
+    Serial.println("[wxradar] app closed; pausing radar polling");
 }
 
 // A Launch Kit push with a custom selection design changes what the knob does on

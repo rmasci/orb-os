@@ -692,6 +692,8 @@ static void draw_glow(lv_draw_ctx_t *d, lv_point_t pos, float baseR, float glowP
 // objects hang off that as easily as one when only one is ever visible.
 static void wx_sweep_draw_cb(lv_event_t *e) {
     RADAR_PHASE(RP_WX);
+    extern bool ui_weather_is_forecast(void);
+    if (ui_weather_is_forecast()) return;
     const theme_style::Weather &ws = theme_style::weather();
     if (!ws.sweepEnabled) return;
     lv_draw_ctx_t *dctx = lv_event_get_draw_ctx(e);

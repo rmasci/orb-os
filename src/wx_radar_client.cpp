@@ -607,29 +607,21 @@ static int load_frame_list(void) {
     return avail;
 }
 
-int wx_radar_fetch_frame(double lat, double lon, int zoomTier, uint32_t gen, int slot) {
-    if (zoomTier < 0 || zoomTier > 1) zoomTier = 0;
-    if (slot < 0 || slot >= WX_RADAR_FRAMES) return 0;
-#ifdef ARDUINO
-    if (WiFi.status() != WL_CONNECTED) return -1;
-#endif
-    if (!wx_radar_back_buffer() || !ensure_decoder()) return -1;
+static bool fetch_and_render_tile(const char *path, double lat, double lon, int zoomTier) {
+    if (!path || !path[0]) return false;
+    if (!wx_radar_back_buffer() || !ensure_decoder()) return false;
     if (!s_nativeBuf) s_nativeBuf = (uint16_t *)heap_caps_malloc(WX_RADAR_SIZE * WX_RADAR_SIZE * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    if (!s_nativeBuf) { Serial.println("[wxradar] PSRAM native buffer allocation failed"); return -1; }
-
-    if (slot == 0) {
-        if (load_frame_list() <= 0) return -1;
-    }
-    if (slot >= s_availFrames || !s_paths[slot][0]) return 0;   // fewer frames than the loop length — done
+    if (!s_nativeBuf) { Serial.println("[wxradar] PSRAM native buffer allocation failed"); return false; }
 
     char url[320];
     snprintf(url, sizeof(url), "%s%s/512/%d/%.5f/%.5f/2/1_1.png",
-             s_host, s_paths[slot], WX_ZOOM[zoomTier].fetchZoomLevel, lat, lon);
+             s_host, path, WX_ZOOM[zoomTier].fetchZoomLevel, lat, lon);
+
     // Stream the tile straight into PSRAM (net_fetch): a 512px PNG can be 100+ KB, and an
     // internal-heap String that big starves the live feed's TLS handshake.
     uint8_t *image = nullptr; size_t imageLen = 0;
     if (!net_fetch_psram(url, ADSB_USER_AGENT, &image, &imageLen, 260000, 3500, 8500)) {
-        Serial.println("[wxradar] tile fetch failed"); return -1;
+        Serial.println("[wxradar] tile fetch failed"); return false;
     }
     memset(s_nativeBuf, 0, WX_RADAR_SIZE * WX_RADAR_SIZE * sizeof(uint16_t));
     s_decodedPixels = 0;
@@ -639,16 +631,16 @@ int wx_radar_fetch_frame(double lat, double lon, int zoomTier, uint32_t gen, int
     const int opened = s_png->openRAM(image, imageLen, radar_png_line);
     if (opened != PNG_SUCCESS) {
         Serial.printf("[wxradar] PNG open error %d\n", opened);
-        heap_caps_free(image); return -1;
+        heap_caps_free(image); return false;
     }
     if (s_png->getWidth() != WX_RADAR_SOURCE_SIZE || s_png->getHeight() != WX_RADAR_SOURCE_SIZE) {
         Serial.println("[wxradar] unexpected tile dimensions");
-        s_png->close(); heap_caps_free(image); return -1;
+        s_png->close(); heap_caps_free(image); return false;
     }
     const int decoded = s_png->decode(nullptr, 0);
     s_png->close();
     heap_caps_free(image);           // PNG fully decoded (or failed) — buffer no longer needed
-    if (decoded != PNG_SUCCESS) { Serial.printf("[wxradar] PNG decode error %d\n", decoded); return -1; }
+    if (decoded != PNG_SUCCESS) { Serial.printf("[wxradar] PNG decode error %d\n", decoded); return false; }
 
     // Composite, bottom up: the theme's background, then the roads and coastline, then the
     // precipitation. The background used to be a memset to black, which is what made a
@@ -664,9 +656,75 @@ int wx_radar_fetch_frame(double lat, double lon, int zoomTier, uint32_t gen, int
     composite_zoom(zoomTier);
     draw_rings(wx_radar_back_buffer());     // over the rain, under the keep-out areas
     wx_apply_zones(wx_radar_back_buffer());
+    return true;
+}
+
+int wx_radar_fetch_frame(double lat, double lon, int zoomTier, uint32_t gen, int slot) {
+    if (zoomTier < 0 || zoomTier > 1) zoomTier = 0;
+    if (slot < 0 || slot >= WX_RADAR_FRAMES) return 0;
+#ifdef ARDUINO
+    if (WiFi.status() != WL_CONNECTED) return -1;
+#endif
+    if (slot == 0) {
+        if (load_frame_list() <= 0) return -1;
+    }
+    if (slot >= s_availFrames || !s_paths[slot][0]) return 0;   // fewer frames than the loop length — done
+
+    if (!fetch_and_render_tile(s_paths[slot], lat, lon, zoomTier)) return -1;
     wx_radar_commit_frame(slot, gen, s_times[slot], lat, lon);
     Serial.printf("[wxradar] gen %lu frame %d/%d @%lu (tier=%d, %lu px)\n",
                   (unsigned long)gen, slot + 1, s_availFrames, (unsigned long)s_times[slot],
                   zoomTier, (unsigned long)s_decodedPixels);
     return 1;
 }
+
+int wx_radar_poll_update(double lat, double lon, int zoomTier, uint32_t &gen) {
+    if (zoomTier < 0 || zoomTier > 1) zoomTier = 0;
+#ifdef ARDUINO
+    if (WiFi.status() != WL_CONNECTED) return 0;
+#endif
+    std::string meta;
+    if (!http_get_string("http://api.rainviewer.com/public/weather-maps.json", meta, 6500)) {
+        Serial.println("[wxradar] poll: metadata fetch failed");
+        return -1;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, meta)) {
+        Serial.println("[wxradar] poll: metadata JSON failed");
+        return -1;
+    }
+    const char *host = doc["host"] | "";
+    JsonArrayConst past = doc["radar"]["past"].as<JsonArrayConst>();
+    if (!host[0] || past.size() == 0) {
+        Serial.println("[wxradar] poll: no radar frames");
+        return -1;
+    }
+    if (!strncmp(host, "https://", 8)) snprintf(s_host, sizeof(s_host), "http://%s", host + 8);
+    else                               snprintf(s_host, sizeof(s_host), "%s", host);
+
+    JsonObjectConst newest = past[past.size() - 1].as<JsonObjectConst>();
+    const uint32_t newestTime = newest["time"] | 0;
+    const char *newestPath = newest["path"] | "";
+    if (!newestPath[0] || newestTime == 0) return -1;
+
+    const uint32_t currentLatest = wx_radar_latest_time();
+    if (newestTime <= currentLatest) {
+        Serial.printf("[wxradar] poll: up to date @%lu (checked RainViewer index)\n", (unsigned long)currentLatest);
+        return 0;
+    }
+
+    Serial.printf("[wxradar] poll: new frame available @%lu (current was @%lu), fetching latest...\n",
+                  (unsigned long)newestTime, (unsigned long)currentLatest);
+
+    if (!fetch_and_render_tile(newestPath, lat, lon, zoomTier)) {
+        Serial.println("[wxradar] poll: tile fetch/render failed");
+        return -1;
+    }
+
+    ++gen;
+    wx_radar_shift_ring_and_commit(gen, newestTime, lat, lon);
+    Serial.printf("[wxradar] committed latest frame @%lu into slot %d\n",
+                  (unsigned long)newestTime, WX_RADAR_FRAMES - 1);
+    return 1;
+}
+

@@ -148,6 +148,43 @@ bool wx_radar_center(double *lat, double *lon) {
     return true;
 }
 
+uint32_t wx_radar_latest_time(void) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    return s_slotTime[WX_RADAR_FRAMES - 1];
+}
+
+bool wx_radar_has_valid_frames(void) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!s_haveCenter) return false;
+    for (int i = 0; i < WX_RADAR_FRAMES; ++i) {
+        if (!s_frames[i] || s_slotGen[i] == 0) return false;
+    }
+    return true;
+}
+
+void wx_radar_shift_ring_and_commit(uint32_t gen, uint32_t frameTime, double lat, double lon) {
+    if (!s_back) return;
+    const size_t bytes = WX_RADAR_SIZE * WX_RADAR_SIZE * sizeof(uint16_t);
+    std::lock_guard<std::mutex> lock(s_mutex);
+
+    // Recycle oldest buffer pointer (slot 0) to hold the incoming newest frame (slot 4)
+    uint16_t *recycled = s_frames[0];
+    for (int i = 0; i < WX_RADAR_FRAMES - 1; ++i) {
+        s_frames[i]   = s_frames[i + 1];
+        s_slotTime[i] = s_slotTime[i + 1];
+        s_slotGen[i]  = gen;
+    }
+    s_frames[WX_RADAR_FRAMES - 1] = recycled;
+    if (recycled) {
+        memcpy(recycled, s_back, bytes);
+    }
+    s_slotTime[WX_RADAR_FRAMES - 1] = frameTime;
+    s_slotGen[WX_RADAR_FRAMES - 1]  = gen;
+    if (gen > s_latestGen) s_latestGen = gen;
+    s_lat = lat; s_lon = lon; s_haveCenter = true;
+    ++s_version;
+}
+
 // ---- what the app is doing, for the screen to say -----------------------------
 //
 // Written by the network task, read by the UI. See the note in wx_radar.h for why these

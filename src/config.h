@@ -114,7 +114,8 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 
 // ---------- Weather forecast (Open-Meteo, no API key) ----------
 #define WEATHER_REFRESH_MS  1800000UL      // 30 minutes; forecast data changes slowly
-#define WX_RADAR_REFRESH_MS 300000UL       // RainViewer frames update about every 5 minutes
+#define WX_RADAR_POLL_MS    60000UL        // Poll RainViewer index every 60 seconds
+#define WX_RADAR_REFRESH_MS 300000UL       // Legacy fallback
 #define CLOUD_IMAGE_REFRESH_MS 600000UL    // EUMETSAT MTG cloud imagery; cache for 10 minutes
 
 // ---------- Screen (CO5300 AMOLED) ----------
