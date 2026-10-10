@@ -1,6 +1,7 @@
 #include "settings_view.h"
 #include "app_shell.h"
 #include "app_theme.h"
+#include "radar_view.h"
 #include "theme_select.h"   // which Launch Kit design (of however many are installed on the SD card) is active
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -942,7 +943,71 @@ namespace {
         lv_obj_align(s_fbHl, LV_ALIGN_CENTER, 0, s_fbSel == 0 ? FB_ROW1_Y : FB_ROW2_Y);
     }
 
+    lv_color_t theme_font_color() {
+        if (app_theme::get() == APP_THEME_OFFICE) {
+            return app_theme::palette().ink;
+        }
+        const char *slug = theme_select::activeSlug();
+        const int rTheme = radar::theme();
+        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
+        if (isVintage) {
+            return lv_color_hex(0xEDE3CC); // warm ivory / cream
+        }
+        if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
+            return lv_color_hex(0xEAFFF3); // phosphor mint
+        }
+        const auto &set = theme_style::settings();
+        if (set.selColor && set.selColor != 0xFFFFFF) {
+            return lv_color_hex(set.selColor);
+        }
+        const Chrome &ch = chrome();
+        if (ch.themed && ch.selColor && ch.selColor != 0xFFFFFF) {
+            return lv_color_hex(ch.selColor);
+        }
+        return lv_color_hex(0xEDE3CC);
+    }
+
+    lv_color_t theme_accent_color() {
+        if (app_theme::get() == APP_THEME_OFFICE) {
+            return app_theme::palette().accent;
+        }
+        const char *slug = theme_select::activeSlug();
+        const int rTheme = radar::theme();
+        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
+        if (isVintage) {
+            return lv_color_hex(0xDACFA6); // warm gold / aged brass
+        }
+        if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
+            return lv_color_hex(0x39FF8A); // phosphor green
+        }
+        const auto &set = theme_style::settings();
+        if (set.hlColor && set.hlColor != 0x232A36) {
+            return lv_color_hex(set.hlColor);
+        }
+        return lv_color_hex(0xF39C12);
+    }
+
+    lv_color_t theme_dim_color() {
+        if (app_theme::get() == APP_THEME_OFFICE) {
+            return app_theme::palette().dim;
+        }
+        const char *slug = theme_select::activeSlug();
+        const int rTheme = radar::theme();
+        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
+        if (isVintage) {
+            return lv_color_hex(0x9C8F73); // warm soft sepia
+        }
+        if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
+            return lv_color_hex(0x5F7A6C);
+        }
+        return C_DIM;
+    }
+
     void refresh_recent() {
+        const lv_color_t fontColor = theme_font_color();
+        const lv_color_t dimColor  = theme_dim_color();
+        if (s_recName)  lv_obj_set_style_text_color(s_recName, fontColor, 0);
+        if (s_recCoord) lv_obj_set_style_text_color(s_recCoord, dimColor, 0);
         if (s_recCount == 0) {
             lv_label_set_text(s_recName, "No recent cities");
             lv_label_set_text(s_recCoord, "search to add one");
@@ -962,6 +1027,10 @@ namespace {
     }
 
     void refresh_search() {
+        const lv_color_t fontColor   = theme_font_color();
+        const lv_color_t accentColor = theme_accent_color();
+        const lv_color_t dimColor    = theme_dim_color();
+        if (s_srchText) lv_obj_set_style_text_color(s_srchText, fontColor, 0);
         lv_label_set_text(s_srchText, s_str[0] ? s_str : "type a city name");
         const bool inKeys = (s_kbIdx < N_KEYS);
         const int  center = inKeys ? s_kbIdx : N_KEYS - 1;
@@ -971,19 +1040,19 @@ namespace {
             if (idx >= 0 && idx < N_KEYS) c[0] = KEYS[idx];
             lv_label_set_text(s_strip[k], c);
             const bool hot = inKeys && (k == 3);
-            lv_obj_set_style_text_color(s_strip[k], hot ? C_WHITE : C_GREY, 0);
+            lv_obj_set_style_text_color(s_strip[k], hot ? fontColor : dimColor, 0);
             lv_obj_set_style_text_font(s_strip[k], hot ? &lv_font_montserrat_28 : &lv_font_montserrat_20, 0);
         }
         if (s_searching) {
             lv_label_set_text(s_sug[0], "searching...");
-            lv_obj_set_style_text_color(s_sug[0], C_GREY, 0);
+            lv_obj_set_style_text_color(s_sug[0], dimColor, 0);
             for (int j = 1; j < 4; ++j) lv_label_set_text(s_sug[j], "");
         } else {
             for (int j = 0; j < 4; ++j) {
                 if (j < s_sugCount) {
                     lv_label_set_text(s_sug[j], s_sugName[j]);
                     const bool hot = !inKeys && (s_kbIdx - N_KEYS == j);
-                    lv_obj_set_style_text_color(s_sug[j], hot ? C_ACCENT : C_DIM, 0);
+                    lv_obj_set_style_text_color(s_sug[j], hot ? accentColor : dimColor, 0);
                 } else lv_label_set_text(s_sug[j], "");
             }
         }
@@ -992,17 +1061,24 @@ namespace {
     void refresh_zip() {
         if (!s_zipPage) return;
 
+        const lv_color_t fontColor   = theme_font_color();
+        const lv_color_t accentColor = theme_accent_color();
+        const lv_color_t dimColor    = theme_dim_color();
+
+        // Title in subtle theme secondary color
+        lv_obj_set_style_text_color(s_zipTitle, dimColor, 0);
+
         // Number keys 0 1 2 3 4 5 6 7 8 9 <
-        // Selected key is bold & underline, NO color change (pure C_WHITE)
+        // Selected key is bold & underline, font color matches theme
         for (int k = 0; k < 11; ++k) {
             bool sel = (k == s_zipSel);
-            lv_obj_set_style_text_color(s_zipKeys[k], C_WHITE, 0);
+            lv_obj_set_style_text_color(s_zipKeys[k], fontColor, 0);
             lv_obj_set_style_text_font(s_zipKeys[k], sel ? &lv_font_montserrat_28 : &lv_font_montserrat_20, 0);
             lv_obj_align(s_zipKeys[k], LV_ALIGN_CENTER, (k - 5) * 36, -48);
         }
 
-        // Underline bar glides directly under selected key
-        lv_obj_set_style_bg_color(s_zipUnderline, C_WHITE, 0);
+        // Underline bar glides directly under selected key in theme font color
+        lv_obj_set_style_bg_color(s_zipUnderline, fontColor, 0);
         lv_obj_align(s_zipUnderline, LV_ALIGN_CENTER, (s_zipSel - 5) * 36, -26);
 
         // 5 Zip code slots: __ __ __ __ __
@@ -1011,13 +1087,13 @@ namespace {
             if (i < len) {
                 char c[2] = { s_zipCode[i], '\0' };
                 lv_label_set_text(s_zipSlot[i], c);
-                lv_obj_set_style_text_color(s_zipSlot[i], C_WHITE, 0);
-                lv_obj_set_style_bg_color(s_zipSlotBar[i], C_WHITE, 0);
+                lv_obj_set_style_text_color(s_zipSlot[i], fontColor, 0);
+                lv_obj_set_style_bg_color(s_zipSlotBar[i], fontColor, 0);
                 lv_obj_set_style_bg_opa(s_zipSlotBar[i], LV_OPA_COVER, 0);
             } else {
                 lv_label_set_text(s_zipSlot[i], "");
                 bool isCursor = (i == len);
-                lv_obj_set_style_bg_color(s_zipSlotBar[i], isCursor ? C_WHITE : C_DIM, 0);
+                lv_obj_set_style_bg_color(s_zipSlotBar[i], isCursor ? fontColor : dimColor, 0);
                 lv_obj_set_style_bg_opa(s_zipSlotBar[i], isCursor ? LV_OPA_COVER : (LV_OPA_COVER * 5 / 10), 0);
             }
         }
@@ -1026,20 +1102,23 @@ namespace {
         if (len == 5) {
             if (s_zipSearching) {
                 lv_label_set_text(s_zipCity, "Looking up...");
-                lv_obj_set_style_text_color(s_zipCity, C_GREY, 0);
+                lv_obj_set_style_text_color(s_zipCity, dimColor, 0);
                 lv_label_set_text(s_zipHint, "searching location...");
+                lv_obj_set_style_text_color(s_zipHint, dimColor, 0);
             } else if (s_zipFound) {
                 lv_label_set_text(s_zipCity, s_zipCityName);
-                lv_obj_set_style_text_color(s_zipCity, C_ACCENT, 0);
+                lv_obj_set_style_text_color(s_zipCity, accentColor, 0);
                 if (s_zipSel == 10) {
                     lv_label_set_text(s_zipHint, "push < to delete digit");
                 } else {
                     lv_label_set_text(s_zipHint, "push or tap to set location");
                 }
+                lv_obj_set_style_text_color(s_zipHint, dimColor, 0);
             } else {
                 lv_label_set_text(s_zipCity, s_zipCityName[0] ? s_zipCityName : "Zip code not found");
                 lv_obj_set_style_text_color(s_zipCity, lv_color_hex(0xFF6B6B), 0);
                 lv_label_set_text(s_zipHint, "turn to < and push to edit");
+                lv_obj_set_style_text_color(s_zipHint, dimColor, 0);
             }
         } else {
             lv_label_set_text(s_zipCity, "");
@@ -1048,6 +1127,7 @@ namespace {
             } else {
                 lv_label_set_text(s_zipHint, "turn to select, push to enter");
             }
+            lv_obj_set_style_text_color(s_zipHint, dimColor, 0);
         }
     }
 
@@ -2296,9 +2376,13 @@ void settingsview::init() {
     lv_obj_set_size(s_zipPage, SCREEN_W, SCREEN_H); lv_obj_center(s_zipPage);
     lv_obj_clear_flag(s_zipPage, LV_OBJ_FLAG_SCROLLABLE);
 
+    const lv_color_t initFontColor   = theme_font_color();
+    const lv_color_t initAccentColor = theme_accent_color();
+    const lv_color_t initDimColor    = theme_dim_color();
+
     s_zipTitle = lv_label_create(s_zipPage);
     lv_label_set_text(s_zipTitle, "Enter Zip Code");
-    lv_obj_set_style_text_color(s_zipTitle, C_GREY, 0);
+    lv_obj_set_style_text_color(s_zipTitle, initDimColor, 0);
     lv_obj_set_style_text_font(s_zipTitle, &lv_font_montserrat_18, 0);
     lv_obj_align(s_zipTitle, LV_ALIGN_CENTER, 0, -115);
 
@@ -2307,7 +2391,7 @@ void settingsview::init() {
         s_zipKeys[k] = lv_label_create(s_zipPage);
         char buf[2] = { ZIP_CHARS[k], '\0' };
         lv_label_set_text(s_zipKeys[k], buf);
-        lv_obj_set_style_text_color(s_zipKeys[k], C_WHITE, 0);
+        lv_obj_set_style_text_color(s_zipKeys[k], initFontColor, 0);
         lv_obj_set_style_text_font(s_zipKeys[k], &lv_font_montserrat_20, 0);
         lv_obj_align(s_zipKeys[k], LV_ALIGN_CENTER, (k - 5) * 36, -48);
     }
@@ -2315,7 +2399,7 @@ void settingsview::init() {
     s_zipUnderline = lv_obj_create(s_zipPage);
     lv_obj_remove_style_all(s_zipUnderline);
     lv_obj_set_size(s_zipUnderline, 24, 3);
-    lv_obj_set_style_bg_color(s_zipUnderline, C_WHITE, 0);
+    lv_obj_set_style_bg_color(s_zipUnderline, initFontColor, 0);
     lv_obj_set_style_bg_opa(s_zipUnderline, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_zipUnderline, 1, 0);
     lv_obj_align(s_zipUnderline, LV_ALIGN_CENTER, -180, -26);
@@ -2323,14 +2407,14 @@ void settingsview::init() {
     for (int i = 0; i < 5; ++i) {
         s_zipSlot[i] = lv_label_create(s_zipPage);
         lv_label_set_text(s_zipSlot[i], "");
-        lv_obj_set_style_text_color(s_zipSlot[i], C_WHITE, 0);
+        lv_obj_set_style_text_color(s_zipSlot[i], initFontColor, 0);
         lv_obj_set_style_text_font(s_zipSlot[i], &lv_font_montserrat_28, 0);
         lv_obj_align(s_zipSlot[i], LV_ALIGN_CENTER, (i - 2) * 44, 18);
 
         s_zipSlotBar[i] = lv_obj_create(s_zipPage);
         lv_obj_remove_style_all(s_zipSlotBar[i]);
         lv_obj_set_size(s_zipSlotBar[i], 32, 3);
-        lv_obj_set_style_bg_color(s_zipSlotBar[i], C_DIM, 0);
+        lv_obj_set_style_bg_color(s_zipSlotBar[i], initDimColor, 0);
         lv_obj_set_style_bg_opa(s_zipSlotBar[i], LV_OPA_COVER, 0);
         lv_obj_set_style_radius(s_zipSlotBar[i], 1, 0);
         lv_obj_align(s_zipSlotBar[i], LV_ALIGN_CENTER, (i - 2) * 44, 42);
@@ -2338,13 +2422,13 @@ void settingsview::init() {
 
     s_zipCity = lv_label_create(s_zipPage);
     lv_label_set_text(s_zipCity, "");
-    lv_obj_set_style_text_color(s_zipCity, C_ACCENT, 0);
+    lv_obj_set_style_text_color(s_zipCity, initAccentColor, 0);
     lv_obj_set_style_text_font(s_zipCity, &lv_font_montserrat_18, 0);
     lv_obj_align(s_zipCity, LV_ALIGN_CENTER, 0, 85);
 
     s_zipHint = lv_label_create(s_zipPage);
     lv_label_set_text(s_zipHint, "turn to select, push to enter");
-    lv_obj_set_style_text_color(s_zipHint, C_GREY, 0);
+    lv_obj_set_style_text_color(s_zipHint, initDimColor, 0);
     lv_obj_set_style_text_font(s_zipHint, &lv_font_montserrat_14, 0);
     lv_obj_align(s_zipHint, LV_ALIGN_CENTER, 0, 140);
 
