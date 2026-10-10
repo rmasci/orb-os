@@ -216,8 +216,8 @@ namespace {
     constexpr int CHIME_UI_MAX = theme_select::MAX_THEMES + 4;
 
     // --- location submenu ---
-    enum { LM_CURRENT = 0, LM_SEARCH, LM_RECENT, LM_BACK, LM_COUNT };
-    const char *LM_LABELS[LM_COUNT] = { "Current location", "Search city", "Recent cities", "Back" };
+    enum { LM_CURRENT = 0, LM_ZIP, LM_SEARCH, LM_RECENT, LM_BACK, LM_COUNT };
+    const char *LM_LABELS[LM_COUNT] = { "Current location", "Enter zip code", "Search city", "Recent cities", "Back" };
 
     // Seed the recents list once (first boot) so "Recent cities" isn't empty.
     struct City { const char *name; double lat; double lon; };
@@ -235,20 +235,11 @@ namespace {
 
     constexpr int RECENTS_MAX = 8;
 
-    // Search keyboard: 26 letters, a comma, '<' (backspace) and '_' (space).
-    //
-    // The comma is how you say WHICH Leeds. The geocoder answers "Leeds, UT" with exactly
-    // one place and "Leeds UT" with none, and a bare "Leeds" puts Leeds, Utah fifth on a
-    // list this screen only has room to show four of, so it could not be reached at all.
-    // Lerxtwood hit that looking for his own town, forked the firmware and added this key
-    // himself (2026-09-23): "Worked like a charm." The other half of his report, scrolling
-    // past the first four matches, would mean rebuilding this panel; a comma costs one
-    // character and answers the same question.
-    //
-    // Counted rather than stated. It was a hand-written 28 sitting two lines under the
-    // string it counts, which is a number that goes wrong the first time somebody adds a key.
-    const char KEYS[]   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ,<_";
-    const int  N_KEYS   = (int)(sizeof(KEYS) - 1);
+    // Search keyboard: 10 digits, 26 letters, a comma, '<' (backspace) and '_' (space).
+    const char KEYS[]     = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ,<_";
+    const int  N_KEYS     = (int)(sizeof(KEYS) - 1);
+    const char ZIP_KEYS[] = "0123456789<";
+    const int  N_ZIP_KEYS = (int)(sizeof(ZIP_KEYS) - 1);
 
     constexpr int BRI_MIN = 8, BRI_MAX = 255, BRI_STEP = 13;
 
@@ -322,7 +313,8 @@ namespace {
     constexpr int WIFI_ROW_DY  = 56;   // was 44; 26 px rows need the room
 
     // search state
-    char   s_str[28]   = "";
+    char   s_str[48]   = "";
+    bool   s_isZipMode = false;
     int    s_kbIdx     = 0;
     char   s_sugName[4][40];
     double s_sugLat[4], s_sugLon[4];
@@ -956,13 +948,15 @@ namespace {
     }
 
     void refresh_search() {
-        lv_label_set_text(s_srchText, s_str[0] ? s_str : "type a city name");
-        const bool inKeys = (s_kbIdx < N_KEYS);
-        const int  center = inKeys ? s_kbIdx : N_KEYS - 1;
+        const char *keys = s_isZipMode ? ZIP_KEYS : KEYS;
+        const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
+        lv_label_set_text(s_srchText, s_str[0] ? s_str : (s_isZipMode ? "enter zip code" : "city or zip code"));
+        const bool inKeys = (s_kbIdx < n_keys);
+        const int  center = inKeys ? s_kbIdx : n_keys - 1;
         for (int k = 0; k < 7; ++k) {
             const int idx = center - 3 + k;
             char c[2] = { 0, 0 };
-            if (idx >= 0 && idx < N_KEYS) c[0] = KEYS[idx];
+            if (idx >= 0 && idx < n_keys) c[0] = keys[idx];
             lv_label_set_text(s_strip[k], c);
             const bool hot = inKeys && (k == 3);
             lv_obj_set_style_text_color(s_strip[k], hot ? C_WHITE : C_GREY, 0);
@@ -976,7 +970,7 @@ namespace {
             for (int j = 0; j < 4; ++j) {
                 if (j < s_sugCount) {
                     lv_label_set_text(s_sug[j], s_sugName[j]);
-                    const bool hot = !inKeys && (s_kbIdx - N_KEYS == j);
+                    const bool hot = !inKeys && (s_kbIdx - n_keys == j);
                     lv_obj_set_style_text_color(s_sug[j], hot ? C_ACCENT : C_DIM, 0);
                 } else lv_label_set_text(s_sug[j], "");
             }
@@ -1150,8 +1144,8 @@ namespace {
         if (s_mode != MODE_SEARCH) return;
         if (s_searching) {                        // "searching" is already painted; do the blocking fetch now
             s_searching = false;
-            s_sugCount = host_geocode(s_str, s_sugName, s_sugLat, s_sugLon, 4);
-            const int total = N_KEYS + s_sugCount;
+            const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
+            const int total = n_keys + s_sugCount;
             if (s_kbIdx >= total) s_kbIdx = total - 1;
             refresh_search();
             return;
@@ -1500,7 +1494,8 @@ void settingsview::onTurn(int delta) {
         s_sel = ITEM_RESET;      // turning either way backs out — this page is confirm/cancel only
         show_page(MODE_MENU);
     } else {  // MODE_SEARCH
-        const int total = N_KEYS + s_sugCount;
+        const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
+        const int total = n_keys + s_sugCount;
         s_kbIdx += step;
         if (s_kbIdx < 0) s_kbIdx = 0;
         if (s_kbIdx >= total) s_kbIdx = total - 1;
@@ -1765,7 +1760,12 @@ void settingsview::onPress() {
             lv_refr_now(NULL);
             host_locate_current();                      // reboots on success
             lv_label_set_text(s_lmItems[LM_CURRENT], LM_LABELS[LM_CURRENT]);  // came back = failed
+        } else if (s_lmSel == LM_ZIP) {
+            s_isZipMode = true;
+            s_str[0] = 0; s_kbIdx = 0; s_sugCount = 0; s_pending = false; s_searching = false;
+            show_page(MODE_SEARCH);
         } else if (s_lmSel == LM_SEARCH) {
+            s_isZipMode = false;
             s_str[0] = 0; s_kbIdx = 0; s_sugCount = 0; s_pending = false; s_searching = false;
             show_page(MODE_SEARCH);
         } else if (s_lmSel == LM_RECENT) {
@@ -1782,29 +1782,22 @@ void settingsview::onPress() {
             show_page(MODE_LOCATION);
         }
     } else {  // MODE_SEARCH
+        const char *keys = s_isZipMode ? ZIP_KEYS : KEYS;
+        const int n_keys = s_isZipMode ? N_ZIP_KEYS : N_KEYS;
         const int L = (int)strlen(s_str);
         // WHICH KEY, by the character it is, not by where it sits.
-        //
-        // This branched on the index: under 26 a letter, 26 backspace, 27 space. Adding one
-        // comma to KEYS on 2026-09-23 therefore moved every special key one place along, and
-        // the comma ran the backspace branch, backspace ran the space branch, and space fell
-        // through to the suggestion branch and did nothing at all. Lerxtwood found it within
-        // a day of the release, having asked for the comma in the first place.
-        //
-        // Reading the character is what makes that impossible rather than merely fixed: the
-        // next key anybody adds goes in the string and nothing else has to be told about it.
-        const char key = (s_kbIdx >= 0 && s_kbIdx < N_KEYS) ? KEYS[s_kbIdx] : '\0';
+        const char key = (s_kbIdx >= 0 && s_kbIdx < n_keys) ? keys[s_kbIdx] : '\0';
         if (key == '<') {                                   // backspace (empty -> exit search)
             if (L > 0) { s_str[L - 1] = 0; mark_dirty(); }
             else { show_page(MODE_LOCATION); }          // exit to Location menu
         } else if (key == '_') {                            // space
             if (L > 0 && L < (int)sizeof(s_str) - 1) { s_str[L] = ' '; s_str[L + 1] = 0; }
             mark_dirty();
-        } else if (key) {                                   // a letter, or the comma
+        } else if (key) {                                   // a digit, letter, or comma
             if (L < (int)sizeof(s_str) - 1) { s_str[L] = key; s_str[L + 1] = 0; }
             mark_dirty();
         } else {                                            // a suggestion
-            const int j = s_kbIdx - N_KEYS;
+            const int j = s_kbIdx - n_keys;
             if (j >= 0 && j < s_sugCount) host_set_location_named(s_sugName[j], s_sugLat[j], s_sugLon[j]);
         }
     }
@@ -2795,8 +2788,9 @@ const char *settingsview::searchType(char c) {
     if (!s_screen) return nullptr;   // not built; see the note above this function
     const char *at = strchr(KEYS, c);
     if (!at) return s_str;
-    s_mode  = MODE_SEARCH;
-    s_kbIdx = (int)(at - KEYS);
+    s_mode      = MODE_SEARCH;
+    s_isZipMode = false;
+    s_kbIdx     = (int)(at - KEYS);
     settingsview::onPress();
     return s_str;
 }
