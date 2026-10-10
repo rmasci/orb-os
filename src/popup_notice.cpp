@@ -69,25 +69,37 @@ void popup_notice::show(const char *msg, const char *title, uint32_t timeoutMs) 
         hintColor  = p.soft;                      // secondary soft text
         cardRadius = 18;
     } else {
-        const char *slug = theme_select::activeSlug();
-        const int rTheme = radar::theme();
-        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
+        const char *slug  = theme_select::activeSlug();
+        const char *label = theme_style::themeLabel();
+        const int   rTheme = radar::theme();
 
-        if (isVintage) {
-            // Aviator / Steam Punk: warm brass/bronze chrome with ivory and cream typography
-            cardBg     = lv_color_hex(0x1B160F); // warm deep walnut/leather tone
+        const bool isAviator = (slug && strcasestr(slug, "aviator")) || (label && !strcasecmp(label, "Aviator")) || (rTheme == THEME_AVIATOR);
+        const bool isSteamPunk = (slug && (strcasestr(slug, "steam") || strcasestr(slug, "punk"))) || (label && (strcasestr(label, "Steam") || strcasestr(label, "Punk")));
+        const bool isMilitary = (slug && strcasestr(slug, "military")) || (label && !strcasecmp(label, "Military")) || (rTheme == THEME_MILITARY);
+
+        if (isAviator) {
+            // Aviator: warm brass/bronze chrome with antique gold typography
+            cardBg     = lv_color_hex(0x1B160F); // warm deep walnut tone
             cardBorder = lv_color_hex(0x6B5A3A); // brass / antique bronze
-            titleColor = lv_color_hex(0xDACFA6); // warm ivory / gold
-            bodyColor  = lv_color_hex(0xEDE3CC); // cream ivory text
-            hintColor  = lv_color_hex(0x9C8F73); // warm soft secondary
+            titleColor = lv_color_hex(0xD8B56A); // warm antique brass gold
+            bodyColor  = lv_color_hex(0xD8B56A); // matching theme gold text
+            hintColor  = lv_color_hex(0x8A7958); // warm muted secondary
             cardRadius = 20;
-        } else if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
+        } else if (isSteamPunk) {
+            // Steam Punk: antique amber and bronze
+            cardBg     = lv_color_hex(0x19140D);
+            cardBorder = lv_color_hex(0x70532E);
+            titleColor = lv_color_hex(0xDAA520); // warm amber brass
+            bodyColor  = lv_color_hex(0xDAA520);
+            hintColor  = lv_color_hex(0x8A7045);
+            cardRadius = 20;
+        } else if (isMilitary) {
             // Military: tactical dark green cockpit
             cardBg     = lv_color_hex(0x0C140E);
             cardBorder = lv_color_hex(0x1E3A2E);
             titleColor = lv_color_hex(0x39FF8A); // phosphor green
-            bodyColor  = lv_color_hex(0xEAFFF3);
-            hintColor  = lv_color_hex(0x5F7A6C);
+            bodyColor  = lv_color_hex(0x39FF8A);
+            hintColor  = lv_color_hex(0x3B6B4C);
             cardRadius = 16;
         } else {
             // Custom SD theme from Launch Kit or Default Orb
@@ -96,15 +108,15 @@ void popup_notice::show(const char *msg, const char *title, uint32_t timeoutMs) 
                 cardBg     = lv_color_hex(0x12151C);
                 cardBorder = lv_color_hex(set.hlColor);
                 titleColor = lv_color_hex(set.selColor ? set.selColor : 0xF39C12);
-                bodyColor  = lv_color_hex((set.selColor && set.selColor != 0xFFFFFF) ? set.selColor : 0xEDE3CC);
+                bodyColor  = lv_color_hex((set.selColor && set.selColor != 0xFFFFFF) ? set.selColor : 0x1DFF86);
                 hintColor  = lv_color_hex(set.itemColor ? set.itemColor : 0x9C8F73);
                 cardRadius = (set.hlRadius > 0) ? set.hlRadius * 2 : 20;
             } else {
-                // Default Orb style (classic slate & warm amber)
+                // Default Orb style (classic slate & phosphor green / warm amber)
                 cardBg     = lv_color_hex(0x161922);
                 cardBorder = lv_color_hex(0x3A4254);
                 titleColor = lv_color_hex(0xF39C12);
-                bodyColor  = lv_color_hex(0xEDE3CC);
+                bodyColor  = lv_color_hex(0x1DFF86);
                 hintColor  = lv_color_hex(0x6C757D);
                 cardRadius = 22;
             }

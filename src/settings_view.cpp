@@ -943,62 +943,82 @@ namespace {
         lv_obj_align(s_fbHl, LV_ALIGN_CENTER, 0, s_fbSel == 0 ? FB_ROW1_Y : FB_ROW2_Y);
     }
 
+    bool is_theme_aviator() {
+        const char *slug = theme_select::activeSlug();
+        const char *label = theme_style::themeLabel();
+        if (slug && strcasestr(slug, "aviator")) return true;
+        if (label && !strcasecmp(label, "Aviator")) return true;
+        return (radar::theme() == THEME_AVIATOR);
+    }
+
+    bool is_theme_steampunk() {
+        const char *slug = theme_select::activeSlug();
+        const char *label = theme_style::themeLabel();
+        if (slug && (strcasestr(slug, "steam") || strcasestr(slug, "punk"))) return true;
+        if (label && (strcasestr(label, "Steam") || strcasestr(label, "Punk"))) return true;
+        return false;
+    }
+
+    bool is_theme_military() {
+        const char *slug = theme_select::activeSlug();
+        const char *label = theme_style::themeLabel();
+        if (slug && strcasestr(slug, "military")) return true;
+        if (label && !strcasecmp(label, "Military")) return true;
+        return (radar::theme() == THEME_MILITARY);
+    }
+
     lv_color_t theme_font_color() {
         if (app_theme::get() == APP_THEME_OFFICE) {
-            return app_theme::palette().ink;
+            return app_theme::palette().accent;
         }
-        const char *slug = theme_select::activeSlug();
-        const int rTheme = radar::theme();
-        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
-        if (isVintage) {
-            return lv_color_hex(0xEDE3CC); // warm ivory / cream
+        if (is_theme_aviator()) {
+            return lv_color_hex(0xD8B56A); // warm antique brass gold (matches Aviator clock/instruments)
         }
-        if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
-            return lv_color_hex(0xEAFFF3); // phosphor mint
+        if (is_theme_steampunk()) {
+            return lv_color_hex(0xDAA520); // warm amber / steampunk brass
+        }
+        if (is_theme_military()) {
+            return lv_color_hex(0x39FF8A); // phosphor green
         }
         const auto &set = theme_style::settings();
-        if (set.selColor && set.selColor != 0xFFFFFF) {
+        if (set.selColor > 0x202020 && set.selColor != 0xFFFFFF) {
             return lv_color_hex(set.selColor);
         }
-        const Chrome &ch = chrome();
-        if (ch.themed && ch.selColor && ch.selColor != 0xFFFFFF) {
-            return lv_color_hex(ch.selColor);
-        }
-        return lv_color_hex(0xEDE3CC);
+        return lv_color_hex(0x1DFF86); // default Orb phosphor green
     }
 
     lv_color_t theme_accent_color() {
         if (app_theme::get() == APP_THEME_OFFICE) {
             return app_theme::palette().accent;
         }
-        const char *slug = theme_select::activeSlug();
-        const int rTheme = radar::theme();
-        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
-        if (isVintage) {
-            return lv_color_hex(0xDACFA6); // warm gold / aged brass
+        if (is_theme_aviator()) {
+            return lv_color_hex(0xF0C366); // bright warm gold highlight
         }
-        if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
-            return lv_color_hex(0x39FF8A); // phosphor green
+        if (is_theme_steampunk()) {
+            return lv_color_hex(0xF39C12); // bright amber highlight
+        }
+        if (is_theme_military()) {
+            return lv_color_hex(0x76E08C); // bright phosphor mint
         }
         const auto &set = theme_style::settings();
         if (set.hlColor && set.hlColor != 0x232A36) {
             return lv_color_hex(set.hlColor);
         }
-        return lv_color_hex(0xF39C12);
+        return lv_color_hex(0xF39C12); // default Orb amber
     }
 
     lv_color_t theme_dim_color() {
         if (app_theme::get() == APP_THEME_OFFICE) {
             return app_theme::palette().dim;
         }
-        const char *slug = theme_select::activeSlug();
-        const int rTheme = radar::theme();
-        bool isVintage = (rTheme == THEME_AVIATOR) || (slug && (!strcasecmp(slug, "aviator") || !strcasecmp(slug, "steam punk") || !strcasecmp(slug, "steampunk")));
-        if (isVintage) {
-            return lv_color_hex(0x9C8F73); // warm soft sepia
+        if (is_theme_aviator()) {
+            return lv_color_hex(0x8A7958); // warm muted sepia/bronze
         }
-        if (rTheme == THEME_MILITARY || (slug && !strcasecmp(slug, "military"))) {
-            return lv_color_hex(0x5F7A6C);
+        if (is_theme_steampunk()) {
+            return lv_color_hex(0x8A7045); // muted bronze
+        }
+        if (is_theme_military()) {
+            return lv_color_hex(0x3B6B4C); // muted tactical green
         }
         return C_DIM;
     }
