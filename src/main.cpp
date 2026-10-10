@@ -508,9 +508,8 @@ static void adsb_task(void*) {
         // Whether the theme has a Flight Tracker at all. A theme that hides it entirely has
         // no reachable screen and no reason to fetch. Whether anyone is LOOKING at it is a
         // separate question, answered below by g_radarViewActive, and it decides how often
-        // the feed is asked: full rate on screen, a slow keep-warm for a while after, then
-        // nothing until the tracker is opened again.
-        const bool radarActive = theme_style::apps().flight;
+        // Flight Tracker is replaced by Weather app; ADS-B radar is inactive
+        const bool radarActive = false;
         if (radarActive && !wasRadarActive) {
             // First tick after boot (or after a theme switch turns Flight Tracker back
             // on): poll right away and give the stuck-feed watchdog a fresh 180s window
@@ -717,9 +716,7 @@ static void adsb_task(void*) {
             if (g_wxOpened) {
                 g_wxOpened = false;
                 wx_phase_set(WX_PHASE_BUFFERS);
-#if !APPS_LAUNCH_ONE
-                if (theme_style::apps().weather) wx_radar_begin();
-#endif
+                wx_radar_begin();
                 wxFillIdx = 0; ++wxGen; nextWxRadarAt = nowMs;
                 wx_phase_set(WiFi.status() == WL_CONNECTED ? WX_PHASE_INDEX : WX_PHASE_NO_WIFI);
             }
@@ -3799,13 +3796,10 @@ void setup() {
     // pinned: it is the screen people come back to, and a rebuild would be felt there more
     // than anywhere else. See the residency note in app_shell.h.
     app_shell::add(clockview::screen(), theme_style::names().clock, nullptr, nullptr, false, clockview::onEnter, clockview::onExit, !theme_style::apps().clock);
-    app_shell::add(radarScreen, theme_style::names().flight, radar_press_custom_or_theme, radar_turn_select, false, radar_show_home_custom, radar_exit_release_style, !theme_style::apps().flight);
+    app_shell::add(radarScreen, theme_style::names().weather, weather_press_cycle, nullptr, false, radar_show_weather, radar_hide_weather, false);
 #if !APPS_LAUNCH_ONE
-    app_shell::add(radarScreen, theme_style::names().weather,  weather_press_cycle, nullptr, false, radar_show_weather, radar_hide_weather, !theme_style::apps().weather);
     spycamview::init();
     psram_mark("after spycamview");
-#endif
-#if !APPS_LAUNCH_ONE
     app_shell::add(spycamview::screen(), theme_style::names().surveillance, spycamview::onPress, spycamview::onTurn, false, nullptr, nullptr, !theme_style::apps().surveillance);  // push cycles cams; clip loads lazily on commit
 #endif
     // Intel before Settings. It used to be appended after, purely because the jumps below
@@ -3848,7 +3842,6 @@ void setup() {
     {
         const theme_style::Apps &ta = theme_style::apps();
         const struct { bool want; const char *name; } cut[] = {
-            { ta.weather,      "Weather Radar" },
             { ta.surveillance, "Surveillance"  },
             { ta.ticker,       "Stock Ticker"  },
         };

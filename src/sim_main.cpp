@@ -653,17 +653,10 @@ static void sim_register_apps(lv_obj_t *radarScreen) {
     // shared radar::knob* handlers, so the simulator and Orb behave identically:
     // default view (knob released, a turn opens the switcher), push to enter
     // selection mode (turn cycles aircraft), push again or wait 5s to drop back.
-    app_shell::add(radarScreen, theme_style::names().flight,
-                   radar::knobPress,                              // onPress
-                   radar::knobTurn,                               // onTurn (only while captured)
-                   false,                                         // start uncaptured (default view)
-                   []() { ui_show_view(0); radar::knobEnter(); }, // onEnter: show scope, then land in default view
-                   radar::knobExit,                               // onExit: free style + reset selection
-                   !theme_style::apps().flight);
-#if !APPS_LAUNCH_ONE
     app_shell::add(radarScreen, theme_style::names().weather,
                    []() { static bool fc = false; fc = !fc; ui_set_weather_forecast(fc); },  // push toggles WX/forecast
-                   nullptr, false, []() { wx_map_prepare(g_set.homeLat, g_set.homeLon, 0); ui_weather_art_attach(); ui_show_view(1); }, nullptr, !theme_style::apps().weather);
+                   nullptr, false, []() { wx_map_prepare(g_set.homeLat, g_set.homeLon, 0); ui_weather_art_attach(); ui_show_view(1); }, nullptr, false);
+#if !APPS_LAUNCH_ONE
     app_shell::add(survScreen,  theme_style::names().surveillance, nullptr, nullptr, false, nullptr, nullptr, !theme_style::apps().surveillance);
 #else
     (void)survScreen;   // built above; not on launch one's roster (CUT-01)
@@ -2212,17 +2205,7 @@ int main(int argc, char **argv) {
         static Uint32 wxAt = 0;
         if (wxShot) {
             if (wxStep == 0 && now - start > 3000) {
-#if APPS_LAUNCH_ONE
-                // The weather map is not on this build's roster (CUT-01), so there is
-                // nothing for this harness to photograph. Said rather than silently
-                // capturing whatever screen happens to be up, which is how the --shot
-                // harness quietly photographed the Clock for six weeks.
-                printf("[sim] --wxshot: the weather map is not in this build "
-                       "(APPS_LAUNCH_ONE in config.h). Nothing to capture.\n");
-                run = false;
-#else
                 app_shell::selectApp(app_shell::APP_WEATHER);
-#endif
                 wxStep = 1; wxAt = now;
             } else if (wxStep == 1 && now - wxAt > 6000) {
                 char path[300]; snprintf(path, sizeof(path), "%s-a.bmp", wxShot);

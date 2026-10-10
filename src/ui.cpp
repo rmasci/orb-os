@@ -1180,6 +1180,7 @@ void ui_create(void) {
     // are switched programmatically by ui_show_view() from each app's onEnter.
     s_tileRadar   = lv_tileview_add_tile(s_tv, 0, 0, LV_DIR_RIGHT);
     s_tileWeather = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
+    lv_obj_clear_flag(s_tileWeather, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_tv, [](lv_event_t *) { refresh_active_tile(); }, LV_EVENT_VALUE_CHANGED, nullptr);
 
     // --- radar tile ---

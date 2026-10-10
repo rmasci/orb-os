@@ -87,9 +87,8 @@ namespace app_shell {
     // and leaving three of them deliberately would make the check cry wolf for ever.
     enum Slot {
         APP_CLOCK = 0,
-        APP_FLIGHT,
-#if !APPS_LAUNCH_ONE
         APP_WEATHER,
+#if !APPS_LAUNCH_ONE
         APP_SURVEILLANCE,
 #endif
         APP_INTEL,
@@ -99,6 +98,7 @@ namespace app_shell {
         APP_SETTINGS,
         APP_COUNT,
     };
+    static constexpr Slot APP_FLIGHT = APP_WEATHER;
 
     // `hidden` apps stay registered (so app indices and selectApp(n) never shift)
     // but are skipped when the knob cycles the menu — a Launch Kit theme flash uses
